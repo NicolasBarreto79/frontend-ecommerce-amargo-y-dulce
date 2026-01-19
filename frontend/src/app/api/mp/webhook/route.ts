@@ -1,7 +1,6 @@
 // src/app/api/mp/webhook/route.ts
 import { NextResponse } from "next/server";
 
-// Evita que Next cachee / optimice esta route
 export const dynamic = "force-dynamic";
 
 /**
@@ -10,20 +9,28 @@ export const dynamic = "force-dynamic";
  * - Consulta el pago real en MP
  * - Actualiza la orden en Strapi con mpPaymentId, mpStatus, orderStatus
  *
- * Nota: Respondemos 200 rápido para que MP no reintente infinito.
+ * IMPORTANTE:
+ * - external_reference puede ser orderId o orderNumber
+ * - Si es orderNumber -> buscamos por filters[orderNumber] y tomamos el id real
+ *
+ * FIX para tu 404:
+ * - Normalizamos STRAPI_URL para evitar casos donde termina en /api y queda /api/api/...
  */
 
 function pickPaymentInfo(url: URL, body: any) {
-  const typeFromQuery = url.searchParams.get("type") || url.searchParams.get("topic");
+  const typeFromQuery =
+    url.searchParams.get("type") ||
+    url.searchParams.get("topic") ||
+    url.searchParams.get("action"); // a veces viene "payment.created"
 
   const qpId =
     url.searchParams.get("data.id") ||
     url.searchParams.get("id") ||
     url.searchParams.get("data[id]") ||
-    url.searchParams.get("payment_id");
+    url.searchParams.get("payment_id") ||
+    url.searchParams.get("collection_id");
 
-  // Body (puede variar)
-  const bodyType = body?.type || body?.topic;
+  const bodyType = body?.type || body?.topic || body?.action;
   const bodyId = body?.data?.id || body?.data?.["id"] || body?.id;
 
   const type = typeFromQuery || bodyType || undefined;
@@ -45,6 +52,51 @@ function mapMpToOrderStatus(mpStatus?: string) {
   }
 }
 
+// ✅ Fix: normaliza base y elimina /api final para evitar /api/api
+function normalizeStrapiBase(url: string) {
+  let u = String(url ?? "").trim();
+  u = u.endsWith("/") ? u.slice(0, -1) : u;
+  if (u.toLowerCase().endsWith("/api")) u = u.slice(0, -4);
+  return u;
+}
+
+function isNumericId(v: string) {
+  return /^\d+$/.test(v);
+}
+
+async function findOrderIdInStrapi(
+  strapiBase: string,
+  token: string,
+  externalRef: string
+) {
+  // Caso A: external_reference es el id numérico de Strapi
+  if (isNumericId(externalRef)) return externalRef;
+
+  // Caso B: external_reference es orderNumber (ej "AMG-0033")
+  const q = new URLSearchParams({
+    "filters[orderNumber][$eq]": externalRef,
+    "pagination[pageSize]": "1",
+    "fields[0]": "id",
+  });
+
+  const res = await fetch(`${strapiBase}/api/orders?${q.toString()}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    cache: "no-store",
+  });
+
+  const data = await res.json().catch(() => null);
+
+  if (!res.ok || !data) {
+    const text = data ? JSON.stringify(data) : "";
+    throw new Error(`Strapi search failed (${res.status}) ${text}`);
+  }
+
+  const id = data?.data?.[0]?.id;
+  return id ? String(id) : null;
+}
+
 export async function POST(req: Request) {
   try {
     const url = new URL(req.url);
@@ -59,11 +111,13 @@ export async function POST(req: Request) {
 
     const { type, paymentId } = pickPaymentInfo(url, body);
 
-    // Responder rápido para que MP no reintente
+    // Respuesta rápida
     if (!paymentId) return NextResponse.json({ ok: true }, { status: 200 });
 
-    // Solo nos interesa payment
-    if (type && type !== "payment") return NextResponse.json({ ok: true }, { status: 200 });
+    // Algunos envían "payment.created" / "payment.updated"
+    if (type && !String(type).includes("payment")) {
+      return NextResponse.json({ ok: true }, { status: 200 });
+    }
 
     const accessToken = process.env.MP_ACCESS_TOKEN;
     if (!accessToken) {
@@ -91,66 +145,78 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    const mpStatus: string | undefined = payment?.status; // approved / pending / rejected / cancelled
-    const externalRef: string | undefined =
-      payment?.external_reference ?? payment?.metadata?.orderId;
+    const mpStatus: string | undefined = payment?.status;
+    const mpStatusDetail: string | undefined = payment?.status_detail;
 
-    if (!externalRef) {
-      console.warn("Webhook: payment sin external_reference/metadata.orderId", {
+    const externalRefRaw =
+      payment?.external_reference ??
+      payment?.metadata?.orderId ??
+      payment?.metadata?.orderNumber;
+
+    if (!externalRefRaw) {
+      console.warn("Webhook: payment sin external_reference / metadata", {
         paymentId,
         mpStatus,
       });
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    // 2) Update en Strapi (server-to-server)
-    // Preferimos STRAPI_URL (server-only). Caemos a NEXT_PUBLIC_STRAPI_URL solo si no hay otra.
-    const strapi =
-      process.env.STRAPI_URL ||
-      process.env.NEXT_PUBLIC_STRAPI_URL ||
-      "http://localhost:1337";
+    const externalRef = String(externalRefRaw);
 
-    // Aceptamos ambos nombres para evitar errores de env
+    // 2) Update en Strapi
+    const strapiBase = normalizeStrapiBase(
+      process.env.STRAPI_URL ||
+        process.env.NEXT_PUBLIC_STRAPI_URL ||
+        "http://localhost:1337"
+    );
+
     const token = process.env.STRAPI_API_TOKEN || process.env.STRAPI_TOKEN;
     if (!token) {
-      console.error("Webhook: falta STRAPI_API_TOKEN / STRAPI_TOKEN (API Token de Strapi)");
+      console.error("Webhook: falta STRAPI_API_TOKEN / STRAPI_TOKEN");
       return NextResponse.json({ ok: true }, { status: 200 });
     }
 
-    // Armamos patch (si externalRef es id numérico, completamos orderNumber)
-    const numericId = Number(externalRef);
-    const orderNumber =
-      Number.isFinite(numericId) && numericId > 0
-        ? `AMG-${String(numericId).padStart(4, "0")}`
-        : undefined;
+    // ✅ FIX PRINCIPAL: resolver el ID real de la orden
+    let orderId: string | null = null;
+    try {
+      orderId = await findOrderIdInStrapi(strapiBase, token, externalRef);
+    } catch (e: any) {
+      console.error("Webhook: no pude resolver orderId en Strapi", e?.message || e);
+      return NextResponse.json({ ok: true }, { status: 200 });
+    }
+
+    if (!orderId) {
+      console.warn("Webhook: order no encontrada en Strapi para externalRef:", externalRef);
+      return NextResponse.json({ ok: true }, { status: 200 });
+    }
 
     const orderStatus = mapMpToOrderStatus(mpStatus);
 
-    const updatePayload: any = {
+    const updatePayload = {
       data: {
         orderStatus,
         mpPaymentId: String(paymentId),
         mpStatus: mpStatus ? String(mpStatus) : null,
-        // opcional: útil para debug
-        mpStatusDetail: payment?.status_detail ?? null,
+        mpStatusDetail: mpStatusDetail ? String(mpStatusDetail) : null,
         mpMerchantOrderId: payment?.order?.id ? String(payment.order.id) : null,
+        mpExternalReference: externalRef, // ahora existe en Strapi (schema.json)
       },
     };
 
-    if (orderNumber) updatePayload.data.orderNumber = orderNumber;
+    const updateUrl = `${strapiBase}/api/orders/${encodeURIComponent(orderId)}`;
+    console.log("[Webhook] strapiBase:", strapiBase);
+    console.log("[Webhook] orderId resolved:", orderId);
+    console.log("[Webhook] update URL:", updateUrl);
 
-    const updateRes = await fetch(
-      `${strapi}/api/orders/${encodeURIComponent(String(externalRef))}`,
-      {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify(updatePayload),
-        cache: "no-store",
-      }
-    );
+    const updateRes = await fetch(updateUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(updatePayload),
+      cache: "no-store",
+    });
 
     if (!updateRes.ok) {
       const text = await updateRes.text().catch(() => "");
@@ -160,7 +226,6 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true }, { status: 200 });
   } catch (err: any) {
     console.error("Webhook: fatal error", err?.message || err);
-    // Igual respondemos 200 para que MP no reintente eternamente
     return NextResponse.json({ ok: true }, { status: 200 });
   }
 }
@@ -169,3 +234,4 @@ export async function POST(req: Request) {
 export async function GET(req: Request) {
   return POST(req);
 }
+
