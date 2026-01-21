@@ -4,24 +4,77 @@ import { InfoStrip } from "@/components/home/InfoStrip";
 import { HomeBestSellers } from "@/components/home/HomeBestSellers";
 import { strapiGet } from "@/lib/strapi";
 import { toCardItem } from "@/lib/strapi-mappers";
+import { HeroCarousel } from "@/components/home/HeroCarousel";
+
+import fs from "fs";
+import path from "path";
 
 type HomePageAttributes = {
   bestSellers?: any[];
 };
 
 type StrapiSingleResponse<T> = {
-  data: {
-    id: number;
-    attributes: T;
-  } | null;
+  data:
+    | {
+        id: number;
+        attributes: T;
+      }
+    | null;
 };
 
+function getHomeSlidesFromPublic() {
+  try {
+    const dir = path.join(process.cwd(), "public", "home");
+    if (!fs.existsSync(dir)) return [];
+
+    const files = fs
+      .readdirSync(dir)
+      .filter((f) => /\.(png|jpe?g|webp|gif)$/i.test(f))
+      .sort((a, b) => a.localeCompare(b)); // orden estable
+
+    // Convertimos a /home/archivo.ext
+    const images = files.map((f) => `/home/${f}`);
+
+    // ✅ Metadata por índice (0,1,2...) para que cada slide tenga su cartel.
+    // Si hay más imágenes, repite la 1ra metadata como fallback.
+    const metaByIndex = [
+      {
+        alt: "Elegí tus favoritos",
+        href: "/productos",
+        title: "Elegí tus favoritos",
+        subtitle: "Chocolates y bombones artesanales",
+        cta: "Comprar ahora",
+      },
+      {
+        alt: "Promociones",
+        href: "/promociones",
+        title: "Promociones",
+        subtitle: "Ofertas por tiempo limitado",
+        cta: "Ver promos",
+      },
+      {
+        alt: "Nuevos productos",
+        href: "/productos",
+        title: "Nuevos productos",
+        subtitle: "Descubrí lo último en la tienda",
+        cta: "Ver productos",
+      },
+    ];
+
+    return images.map((img, i) => {
+      const meta = metaByIndex[i] ?? metaByIndex[0];
+      return {
+        id: `home-${i + 1}`,
+        image: img,
+        ...meta,
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
 export default async function HomePage() {
-  /**
-   * Strapi v4 Single Type devuelve:
-   * { data: { id, attributes: { ... } } }
-   * (no devuelve bestSellers directo en data)
-   */
   let bestSellers: any[] = [];
 
   try {
@@ -31,14 +84,55 @@ export default async function HomePage() {
 
     const raw = res?.data?.attributes?.bestSellers ?? [];
     bestSellers = Array.isArray(raw) ? raw.map(toCardItem) : [];
-  } catch (err) {
-    // Si Strapi responde 401 (permisos) o no existe el single type, no tiramos abajo toda la home.
-    // Mostramos la página igual, solo sin best sellers.
+  } catch {
     bestSellers = [];
+  }
+
+  // ✅ Slides: auto desde /public/home/*
+  let slides = getHomeSlidesFromPublic();
+
+  // ✅ Fallback si no hay nada en /public/home
+  if (!slides.length) {
+    slides = [
+      {
+        id: "s1",
+        image: "/home/hero-1.jpg",
+        alt: "Elegí tus favoritos",
+        href: "/productos",
+        title: "Elegí tus favoritos",
+        subtitle: "Chocolates y bombones artesanales",
+        cta: "Comprar ahora",
+      },
+      {
+        id: "s2",
+        image: "/home/hero-2.jpg",
+        alt: "Promociones",
+        href: "/promociones",
+        title: "Promociones",
+        subtitle: "Ofertas por tiempo limitado",
+        cta: "Ver promos",
+      },
+      {
+        id: "s3",
+        image: "/home/hero-3.jpg",
+        alt: "Nuevos productos",
+        href: "/productos",
+        title: "Nuevos productos",
+        subtitle: "Descubrí lo último en la tienda",
+        cta: "Ver productos",
+      },
+    ];
   }
 
   return (
     <>
+      {/* ✅ CARRUSEL */}
+      <Container>
+        <div className="pt-8">
+          <HeroCarousel slides={slides} intervalMs={4500} />
+        </div>
+      </Container>
+
       {/* HERO / PRESENTACIÓN */}
       <Container>
         <div className="py-10">
@@ -51,6 +145,7 @@ export default async function HomePage() {
             <Link className="rounded-md bg-red-600 px-4 py-2 text-white" href="/productos">
               Ver productos
             </Link>
+
             <Link className="rounded-md border px-4 py-2" href="/login">
               Iniciar sesión
             </Link>
