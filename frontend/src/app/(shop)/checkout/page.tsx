@@ -64,6 +64,23 @@ type Quote = {
   }>;
 };
 
+function toNum(v: any, def = 0) {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+
+function normalizeQuote(data: any, fallbackSubtotal: number): Quote {
+  const s = Math.round(toNum(data?.subtotal, fallbackSubtotal));
+  const d = Math.round(toNum(data?.discountTotal, 0));
+  const tot = Math.round(toNum(data?.total, Math.max(0, s - d)));
+  return {
+    subtotal: s,
+    discountTotal: d,
+    total: tot,
+    appliedPromotions: Array.isArray(data?.appliedPromotions) ? data.appliedPromotions : [],
+  };
+}
+
 /* ================= page ================= */
 
 export default function CheckoutPage() {
@@ -76,10 +93,10 @@ export default function CheckoutPage() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
 
-  // ✅ obligatorios
+  // obligatorios
   const [phone, setPhone] = useState("");
 
-  // ✅ shippingAddress estructurado (obligatorios salvo notes)
+  // shippingAddress
   const [street, setStreet] = useState("");
   const [number, setNumber] = useState("");
   const [city, setCity] = useState("");
@@ -87,8 +104,9 @@ export default function CheckoutPage() {
   const [postalCode, setPostalCode] = useState("");
   const [notes, setNotes] = useState("");
 
-  // ✅ cupón (PRO)
+  // cupón
   const [coupon, setCoupon] = useState("");
+  const [couponTouched, setCouponTouched] = useState(false);
 
   const [loading, setLoading] = useState(false);
   const [quoting, setQuoting] = useState(false);
@@ -108,15 +126,13 @@ export default function CheckoutPage() {
   const redirectedStatus = sp.get("status") || "";
   const redirectedOrderId = sp.get("orderId") || "";
 
-  // ✅ Redirigir a /gracias si vuelve con query (evita duplicación de lógica)
+  // Redirigir si vuelve con query
   useEffect(() => {
     const status = sp.get("status");
     const orderId = sp.get("orderId");
     if (orderId && status) {
       router.replace(
-        `/gracias?status=${encodeURIComponent(status)}&orderId=${encodeURIComponent(
-          orderId
-        )}`
+        `/gracias?status=${encodeURIComponent(status)}&orderId=${encodeURIComponent(orderId)}`
       );
     }
   }, [sp, router]);
@@ -129,27 +145,26 @@ export default function CheckoutPage() {
 
   useEffect(() => {
     if (redirectedOrderId) {
-      setUi({
-        kind: "checking",
-        orderId: redirectedOrderId,
-        status: redirectedStatus,
-      });
+      setUi({ kind: "checking", orderId: redirectedOrderId, status: redirectedStatus });
     } else {
       setUi({ kind: "form" });
     }
   }, [redirectedOrderId, redirectedStatus]);
 
-  // Subtotal UI (por si falla quote)
-  const uiSubtotal = useMemo(
-    () =>
-      cartItems.reduce((acc, it: any) => {
-        const unit = priceWithOff(it.price, it.off);
-        return acc + unit * it.qty;
-      }, 0),
-    [cartItems]
-  );
+  /* ================== subtotal UI (igual que carrito) ================== */
 
-  // Payload quote: solo id+qty (backend trae precios reales)
+  const uiSubtotal = useMemo(() => {
+    return cartItems.reduce((acc, it: any) => {
+      const unit = priceWithOff(Number(it.price) || 0, it.off);
+      const qty = Math.max(1, Math.floor(Number(it.qty) || 1));
+      return acc + unit * qty;
+    }, 0);
+  }, [cartItems]);
+
+  /**
+   * ✅ Payload quote: IGUAL que carrito
+   * Enviamos SOLO id + qty (el backend trae precios reales y calcula promos)
+   */
   const payloadItems = useMemo(() => {
     return (cartItems as any[])
       .map((it) => ({
@@ -159,7 +174,8 @@ export default function CheckoutPage() {
       .filter((x) => Number.isFinite(x.id) && x.id > 0);
   }, [cartItems]);
 
-  // Quote PRO
+  /* ================= quote PRO (igual que carrito, con fallback) ================= */
+
   const [quote, setQuote] = useState<Quote>({
     subtotal: 0,
     discountTotal: 0,
@@ -169,6 +185,7 @@ export default function CheckoutPage() {
 
   useEffect(() => {
     let alive = true;
+    const fallbackS = Math.round(uiSubtotal);
 
     if (!payloadItems.length) {
       setQuote({ subtotal: 0, discountTotal: 0, total: 0, appliedPromotions: [] });
@@ -179,6 +196,7 @@ export default function CheckoutPage() {
     const t = setTimeout(async () => {
       try {
         setQuoting(true);
+
         const res = await fetch("/api/promotions/quote", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -187,26 +205,22 @@ export default function CheckoutPage() {
             coupon: coupon.trim(),
             shipping: 0,
           }),
+          cache: "no-store",
         });
 
-        const data = (await res.json()) as Quote;
+        const data = await res.json().catch(() => null);
         if (!alive) return;
 
-        const s = Number(data?.subtotal) || Math.round(uiSubtotal);
-        const d = Number(data?.discountTotal) || 0;
-        const tot =
-          Number(data?.total) || Math.max(0, s - d);
+        if (!res.ok) {
+          console.error("[quote] error:", data);
+          setQuote({ subtotal: fallbackS, discountTotal: 0, total: fallbackS, appliedPromotions: [] });
+          return;
+        }
 
-        setQuote({
-          subtotal: s,
-          discountTotal: d,
-          total: tot,
-          appliedPromotions: Array.isArray(data?.appliedPromotions) ? data.appliedPromotions : [],
-        });
+        setQuote(normalizeQuote(data, fallbackS));
       } catch {
         if (!alive) return;
-        const s = Math.round(uiSubtotal);
-        setQuote({ subtotal: s, discountTotal: 0, total: s, appliedPromotions: [] });
+        setQuote({ subtotal: fallbackS, discountTotal: 0, total: fallbackS, appliedPromotions: [] });
       } finally {
         if (alive) setQuoting(false);
       }
@@ -220,8 +234,9 @@ export default function CheckoutPage() {
 
   const effectiveSubtotal = payloadItems.length ? (quote.subtotal || Math.round(uiSubtotal)) : 0;
   const effectiveDiscount = payloadItems.length ? quote.discountTotal : 0;
-  const effectiveTotal =
-    payloadItems.length ? (quote.total || Math.max(0, effectiveSubtotal - effectiveDiscount)) : 0;
+  const effectiveTotal = payloadItems.length
+    ? (quote.total || Math.max(0, effectiveSubtotal - effectiveDiscount))
+    : 0;
 
   /* ================= polling ================= */
 
@@ -238,9 +253,7 @@ export default function CheckoutPage() {
 
         if (!alive) return;
 
-        // soporta v4 y v5
-        const orderStatus =
-          json?.data?.attributes?.orderStatus ?? json?.orderStatus ?? null;
+        const orderStatus = json?.data?.attributes?.orderStatus ?? json?.orderStatus ?? null;
 
         if (orderStatus === "paid") {
           setUi({ kind: "paid", orderId: ui.orderId });
@@ -269,13 +282,12 @@ export default function CheckoutPage() {
       alive = false;
       clearInterval(id);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ui, clear]);
 
   /* ================= submit ================= */
 
   async function fetchFinalQuote(): Promise<Quote> {
-    // “blindaje”: recalculamos justo antes de crear orden / MP
+    const fallbackS = Math.round(uiSubtotal);
     try {
       const res = await fetch("/api/promotions/quote", {
         method: "POST",
@@ -285,20 +297,15 @@ export default function CheckoutPage() {
           coupon: coupon.trim(),
           shipping: 0,
         }),
+        cache: "no-store",
       });
-      const data = (await res.json()) as Quote;
-      const s = Number(data?.subtotal) || Math.round(uiSubtotal);
-      const d = Number(data?.discountTotal) || 0;
-      const tot = Number(data?.total) || Math.max(0, s - d);
-      return {
-        subtotal: s,
-        discountTotal: d,
-        total: tot,
-        appliedPromotions: Array.isArray(data?.appliedPromotions) ? data.appliedPromotions : [],
-      };
+
+      const data = await res.json().catch(() => null);
+      if (!res.ok) return { subtotal: fallbackS, discountTotal: 0, total: fallbackS, appliedPromotions: [] };
+
+      return normalizeQuote(data, fallbackS);
     } catch {
-      const s = Math.round(uiSubtotal);
-      return { subtotal: s, discountTotal: 0, total: s, appliedPromotions: [] };
+      return { subtotal: fallbackS, discountTotal: 0, total: fallbackS, appliedPromotions: [] };
     }
   }
 
@@ -310,33 +317,28 @@ export default function CheckoutPage() {
     if (trimmedName.length < 2) return setError("Ingresá un nombre válido.");
     if (!trimmedEmail.includes("@")) return setError("Ingresá un email válido.");
 
-    // ✅ obligatorios
     if (trimmedPhone.length < 6) return setError("Ingresá un teléfono válido.");
     if (trimmedStreet.length < 2) return setError("Ingresá la calle.");
     if (trimmedNumber.length < 1) return setError("Ingresá el número/altura.");
     if (trimmedCity.length < 2) return setError("Ingresá la ciudad.");
     if (trimmedProvince.length < 2) return setError("Ingresá la provincia.");
-    if (trimmedPostalCode.length < 4)
-      return setError("Ingresá un código postal válido.");
+    if (trimmedPostalCode.length < 4) return setError("Ingresá un código postal válido.");
 
     localStorage.setItem("amg_email", trimmedEmail.toLowerCase());
 
     try {
       setLoading(true);
 
-      // ✅ recalcular quote antes de crear orden / MP
       const finalQuote = await fetchFinalQuote();
-
       const mpExternalReference = safeUUID();
 
-      /* 1️⃣ Crear orden (guardando subtotal/descuento/promos/cupón) */
+      /* 1️⃣ Crear orden */
       const createRes = await fetch("/api/orders/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: trimmedName,
           email: trimmedEmail,
-
           phone: trimmedPhone,
 
           shippingAddress: {
@@ -346,78 +348,63 @@ export default function CheckoutPage() {
             province: trimmedProvince,
             postalCode: trimmedPostalCode,
             notes: trimmedNotes || null,
-
-            // ✅ legible
             text: `${trimmedStreet} ${trimmedNumber}, ${trimmedCity}, ${trimmedProvince} (${trimmedPostalCode})`,
           },
 
-          // ✅ PRO totals
           subtotal: finalQuote.subtotal,
           discountTotal: finalQuote.discountTotal,
           appliedPromotions: finalQuote.appliedPromotions,
           coupon: coupon.trim() || null,
-
-          // ✅ total blindado
           total: finalQuote.total,
 
           mpExternalReference,
 
           items: cartItems.map((it: any) => ({
             productId: Number(it.id),
-            productDocumentId: it.documentId ?? null,
+            productDocumentId: it?.documentId ?? it?.productDocumentId ?? null,
             slug: String(it.slug || "").trim(),
             title: it.title,
-            qty: it.qty,
-            unit_price: priceWithOff(it.price, it.off),
-            price: it.price,
-            off: it.off,
+            qty: Math.max(1, Math.floor(Number(it.qty) || 1)),
+            unit_price: priceWithOff(Number(it.price) || 0, it.off),
+            price: Number(it.price) || 0,
+            off: it.off ?? null,
           })),
         }),
       });
 
       const created = await createRes.json().catch(() => null);
-      if (!createRes.ok) {
-        throw new Error(pickErrorMessage(created, "No se pudo crear la orden"));
-      }
+      if (!createRes.ok) throw new Error(pickErrorMessage(created, "No se pudo crear la orden"));
 
-      // ✅ Strapi v5: el ID real para operar por /api/orders/:id es documentId
       const orderId: string | undefined = created?.orderDocumentId || created?.orderId;
       const orderNumericId: string | undefined = created?.orderNumericId;
       const mpExtFromServer: string | undefined = created?.mpExternalReference;
 
-      if (!orderId) {
-        throw new Error("No se recibió orderDocumentId/orderId desde /api/orders/create");
-      }
+      if (!orderId) throw new Error("No se recibió orderDocumentId/orderId desde /api/orders/create");
 
       const mpExternalReferenceFinal = mpExtFromServer || mpExternalReference;
       const orderNumber = makeOrderNumber(orderNumericId || orderId);
 
-      /* 2️⃣ Preferencia MP (cobra quote.total) */
+      /* 2️⃣ Preferencia MP */
       const mpItems = cartItems
         .map((it: any) => ({
           title: it.title,
-          qty: Number(it.qty ?? 1),
-          unit_price: Number(priceWithOff(it.price, it.off)),
-          productDocumentId: it.documentId ?? null, // ✅ útil si validás stock en create-preference
+          qty: Math.max(1, Math.floor(Number(it.qty) || 1)),
+          unit_price: Number(priceWithOff(Number(it.price) || 0, it.off)),
+          productDocumentId: it?.documentId ?? it?.productDocumentId ?? null,
         }))
-        .filter(
-          (x: any) => x.qty > 0 && Number.isFinite(x.unit_price) && x.unit_price > 0
-        );
+        .filter((x: any) => x.qty > 0 && Number.isFinite(x.unit_price) && x.unit_price > 0);
 
-      if (mpItems.length === 0) {
-        throw new Error("No hay items válidos para MercadoPago (precio/cantidad).");
-      }
+      if (mpItems.length === 0) throw new Error("No hay items válidos para MercadoPago.");
 
       const prefRes = await fetch("/api/mp/create-preference", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          orderId, // ✅ documentId
+          orderId,
           orderNumber,
           mpExternalReference: mpExternalReferenceFinal,
           items: mpItems,
 
-          // ✅ PRO totals para cobrar
           total: finalQuote.total,
           subtotal: finalQuote.subtotal,
           discountTotal: finalQuote.discountTotal,
@@ -427,16 +414,10 @@ export default function CheckoutPage() {
       });
 
       const pref = await prefRes.json().catch(() => null);
-      if (!prefRes.ok) {
-        throw new Error(pickErrorMessage(pref, "No se pudo crear la preferencia MP"));
-      }
+      if (!prefRes.ok) throw new Error(pickErrorMessage(pref, "No se pudo crear la preferencia MP"));
 
-      const checkoutUrl: string | undefined =
-        pref?.sandbox_init_point || pref?.init_point;
-
-      if (!checkoutUrl) {
-        throw new Error("MercadoPago no devolvió init_point / sandbox_init_point.");
-      }
+      const checkoutUrl: string | undefined = pref?.sandbox_init_point || pref?.init_point;
+      if (!checkoutUrl) throw new Error("MercadoPago no devolvió init_point / sandbox_init_point.");
 
       window.location.href = checkoutUrl;
     } catch (err: any) {
@@ -448,101 +429,51 @@ export default function CheckoutPage() {
 
   /* ================= UI ================= */
 
+  const showInvalidCoupon =
+    payloadItems.length > 0 &&
+    (quote.subtotal || Math.round(uiSubtotal)) > 0 &&
+    couponTouched &&
+    coupon.trim().length > 0 &&
+    !quoting &&
+    (quote.appliedPromotions?.length ?? 0) === 0;
+
   return (
     <main>
       <Container>
         <h1 className="text-3xl font-extrabold py-8">Checkout</h1>
 
         {error && (
-          <div className="mb-4 rounded bg-red-50 p-3 text-sm text-red-700">
-            {error}
-          </div>
+          <div className="mb-4 rounded bg-red-50 p-3 text-sm text-red-700">{error}</div>
         )}
 
         {ui.kind === "form" && (
           <form onSubmit={handleSubmit} className="max-w-md space-y-4">
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="Nombre"
-              className="w-full border p-2"
-              required
-            />
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nombre" className="w-full border p-2" required />
+            <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" type="email" className="w-full border p-2" required />
+            <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Teléfono" type="tel" className="w-full border p-2" required />
 
-            <input
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="Email"
-              type="email"
-              className="w-full border p-2"
-              required
-            />
+            <input value={street} onChange={(e) => setStreet(e.target.value)} placeholder="Calle" className="w-full border p-2" required />
+            <input value={number} onChange={(e) => setNumber(e.target.value)} placeholder="Número / Altura" className="w-full border p-2" required />
+            <input value={city} onChange={(e) => setCity(e.target.value)} placeholder="Ciudad" className="w-full border p-2" required />
+            <input value={province} onChange={(e) => setProvince(e.target.value)} placeholder="Provincia" className="w-full border p-2" required />
+            <input value={postalCode} onChange={(e) => setPostalCode(e.target.value)} placeholder="Código postal" className="w-full border p-2" inputMode="numeric" required />
 
-            <input
-              value={phone}
-              onChange={(e) => setPhone(e.target.value)}
-              placeholder="Teléfono"
-              type="tel"
-              className="w-full border p-2"
-              required
-            />
+            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Notas (piso, depto, referencia, timbre...) (opcional)" className="w-full border p-2" rows={2} />
 
-            <input
-              value={street}
-              onChange={(e) => setStreet(e.target.value)}
-              placeholder="Calle"
-              className="w-full border p-2"
-              required
-            />
-
-            <input
-              value={number}
-              onChange={(e) => setNumber(e.target.value)}
-              placeholder="Número / Altura"
-              className="w-full border p-2"
-              required
-            />
-
-            <input
-              value={city}
-              onChange={(e) => setCity(e.target.value)}
-              placeholder="Ciudad"
-              className="w-full border p-2"
-              required
-            />
-
-            <input
-              value={province}
-              onChange={(e) => setProvince(e.target.value)}
-              placeholder="Provincia"
-              className="w-full border p-2"
-              required
-            />
-
-            <input
-              value={postalCode}
-              onChange={(e) => setPostalCode(e.target.value)}
-              placeholder="Código postal"
-              className="w-full border p-2"
-              inputMode="numeric"
-              required
-            />
-
-            <textarea
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              placeholder="Notas (piso, depto, referencia, timbre...) (opcional)"
-              className="w-full border p-2"
-              rows={2}
-            />
-
-            {/* ✅ Cupón */}
+            {/* Cupón */}
             <input
               value={coupon}
-              onChange={(e) => setCoupon(e.target.value)}
+              onChange={(e) => {
+                setCouponTouched(true);
+                setCoupon(e.target.value);
+              }}
               placeholder="Cupón (opcional)"
               className="w-full border p-2"
             />
+
+            {showInvalidCoupon ? (
+              <div className="text-xs text-red-600">Cupón inválido o no aplicable.</div>
+            ) : null}
 
             <div className="rounded border p-3 text-sm">
               <div className="flex items-center justify-between">
@@ -560,9 +491,7 @@ export default function CheckoutPage() {
                 <span>{formatARS(effectiveTotal)}</span>
               </div>
 
-              {quoting ? (
-                <div className="mt-2 text-xs opacity-70">Calculando promociones…</div>
-              ) : null}
+              {quoting ? <div className="mt-2 text-xs opacity-70">Calculando promociones…</div> : null}
 
               {quote.appliedPromotions?.length ? (
                 <div className="mt-3">
@@ -582,11 +511,7 @@ export default function CheckoutPage() {
               ) : null}
             </div>
 
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full rounded bg-red-600 py-3 text-white disabled:opacity-60"
-            >
+            <button type="submit" disabled={loading || quoting} className="w-full rounded bg-red-600 py-3 text-white disabled:opacity-60">
               {loading ? "Redirigiendo…" : "Pagar con MercadoPago"}
             </button>
 

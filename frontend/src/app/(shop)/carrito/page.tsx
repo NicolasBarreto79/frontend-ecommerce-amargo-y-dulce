@@ -42,8 +42,7 @@ export default function CarritoPage() {
     return acc + unit * it.qty;
   }, 0);
 
-  // Cupón + quote desde backend (reglas PRO)
-  const [coupon, setCoupon] = useState("");
+  // ✅ Quote desde backend (reglas PRO) — SIN cupón en carrito
   const [quote, setQuote] = useState<Quote>({
     subtotal: 0,
     discountTotal: 0,
@@ -81,7 +80,7 @@ export default function CarritoPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             items: payloadItems,
-            coupon: coupon.trim(),
+            coupon: "", // ✅ NO cupón en carrito
             shipping: 0,
           }),
         });
@@ -110,12 +109,14 @@ export default function CarritoPage() {
       alive = false;
       clearTimeout(t);
     };
-  }, [payloadItems, coupon, uiSubtotal]);
+  }, [payloadItems, uiSubtotal]);
 
   // Totales a mostrar: preferimos quote si vino (y si hay items)
   const effectiveSubtotal = payloadItems.length ? (quote.subtotal || Math.round(uiSubtotal)) : 0;
   const effectiveDiscount = payloadItems.length ? quote.discountTotal : 0;
-  const effectiveTotal = payloadItems.length ? (quote.total || Math.max(0, effectiveSubtotal - effectiveDiscount)) : 0;
+  const effectiveTotal = payloadItems.length
+    ? quote.total || Math.max(0, effectiveSubtotal - effectiveDiscount)
+    : 0;
 
   return (
     <main>
@@ -259,63 +260,6 @@ export default function CarritoPage() {
           <aside className="h-fit rounded-xl border border-neutral-200 bg-white p-6 shadow-sm">
             <h2 className="text-lg font-extrabold text-neutral-900">Resumen</h2>
 
-            {/* Promos (PRO) */}
-            <div className="mt-4 rounded-xl bg-[#FAF7F2] p-4">
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2 font-bold text-neutral-900">
-                  <BadgePercent className="h-5 w-5" />
-                  Promociones
-                </div>
-                {items.length > 0 ? (
-                  <span className="text-xs text-neutral-600">
-                    {isQuoting ? "Calculando..." : "Actualizado"}
-                  </span>
-                ) : null}
-              </div>
-
-              {/* Cupón */}
-              <div className="mt-3">
-                <label className="block text-xs font-semibold text-neutral-700">
-                  Cupón (opcional)
-                </label>
-                <input
-                  value={coupon}
-                  onChange={(e) => setCoupon(e.target.value)}
-                  placeholder="Ej: CUPON10"
-                  className="mt-2 w-full rounded-lg border border-neutral-200 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-red-200"
-                />
-                <p className="mt-2 text-[11px] text-neutral-600">
-                  Los descuentos se calculan del lado del backend para evitar cambios manuales.
-                </p>
-              </div>
-
-              {/* Aplicadas */}
-              {items.length > 0 && quote.appliedPromotions?.length > 0 ? (
-                <div className="mt-4 rounded-lg border border-neutral-200 bg-white p-3">
-                  <p className="text-xs font-bold text-neutral-900">Aplicadas</p>
-                  <ul className="mt-2 space-y-1 text-sm text-neutral-800">
-                    {quote.appliedPromotions.map((p) => (
-                      <li key={p.id} className="flex justify-between gap-3">
-                        <span className="truncate">
-                          {p.name}
-                          {p.code ? (
-                            <span className="ml-2 rounded-full bg-neutral-100 px-2 py-0.5 text-[11px] text-neutral-700">
-                              {p.code}
-                            </span>
-                          ) : null}
-                        </span>
-                        <span className="font-semibold">-{formatARS(p.amount)}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ) : items.length > 0 ? (
-                <div className="mt-4 text-xs text-neutral-700">
-                  No hay promociones aplicadas{coupon.trim() ? " (revisá el cupón)." : "."}
-                </div>
-              ) : null}
-            </div>
-
             {/* Totales */}
             <div className="mt-5 space-y-2 text-sm">
               <div className="flex justify-between text-neutral-700">
@@ -325,12 +269,6 @@ export default function CarritoPage() {
                 </span>
               </div>
 
-              <div className="flex justify-between text-neutral-700">
-                <span>Descuento</span>
-                <span className="font-semibold text-neutral-900">
-                  -{formatARS(effectiveDiscount)}
-                </span>
-              </div>
 
               <div className="my-3 h-px bg-neutral-200" />
 
