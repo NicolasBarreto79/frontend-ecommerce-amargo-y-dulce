@@ -64,6 +64,13 @@ type Quote = {
   }>;
 };
 
+type StockProblem = {
+  productDocumentId: string;
+  title: string;
+  requested: number;
+  available: number;
+};
+
 function toNum(v: any, def = 0) {
   const n = typeof v === "number" ? v : Number(v);
   return Number.isFinite(n) ? n : def;
@@ -110,7 +117,11 @@ export default function CheckoutPage() {
 
   const [loading, setLoading] = useState(false);
   const [quoting, setQuoting] = useState(false);
+
+  // ✅ error general
   const [error, setError] = useState<string | null>(null);
+  // ✅ errores de stock (vienen del backend /api/mp/create-preference con 409)
+  const [stockProblems, setStockProblems] = useState<StockProblem[]>([]);
 
   const trimmedName = name.trim();
   const trimmedEmail = email.trim();
@@ -213,7 +224,12 @@ export default function CheckoutPage() {
 
         if (!res.ok) {
           console.error("[quote] error:", data);
-          setQuote({ subtotal: fallbackS, discountTotal: 0, total: fallbackS, appliedPromotions: [] });
+          setQuote({
+            subtotal: fallbackS,
+            discountTotal: 0,
+            total: fallbackS,
+            appliedPromotions: [],
+          });
           return;
         }
 
@@ -301,7 +317,9 @@ export default function CheckoutPage() {
       });
 
       const data = await res.json().catch(() => null);
-      if (!res.ok) return { subtotal: fallbackS, discountTotal: 0, total: fallbackS, appliedPromotions: [] };
+      if (!res.ok) {
+        return { subtotal: fallbackS, discountTotal: 0, total: fallbackS, appliedPromotions: [] };
+      }
 
       return normalizeQuote(data, fallbackS);
     } catch {
@@ -312,6 +330,7 @@ export default function CheckoutPage() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
+    setStockProblems([]);
 
     if (!cartItems.length) return setError("Tu carrito está vacío.");
     if (trimmedName.length < 2) return setError("Ingresá un nombre válido.");
@@ -332,6 +351,12 @@ export default function CheckoutPage() {
       const finalQuote = await fetchFinalQuote();
       const mpExternalReference = safeUUID();
 
+      // ✅ sanity: total siempre number > 0
+      const totalNum = Math.round(toNum(finalQuote?.total, 0));
+      if (!Number.isFinite(totalNum) || totalNum <= 0) {
+        throw new Error("Total inválido. Revisá tu carrito o promociones.");
+      }
+
       /* 1️⃣ Crear orden */
       const createRes = await fetch("/api/orders/create", {
         method: "POST",
@@ -351,11 +376,11 @@ export default function CheckoutPage() {
             text: `${trimmedStreet} ${trimmedNumber}, ${trimmedCity}, ${trimmedProvince} (${trimmedPostalCode})`,
           },
 
-          subtotal: finalQuote.subtotal,
-          discountTotal: finalQuote.discountTotal,
+          subtotal: Math.round(toNum(finalQuote.subtotal, 0)),
+          discountTotal: Math.round(toNum(finalQuote.discountTotal, 0)),
           appliedPromotions: finalQuote.appliedPromotions,
           coupon: coupon.trim() || null,
-          total: finalQuote.total,
+          total: totalNum,
 
           mpExternalReference,
 
@@ -373,13 +398,17 @@ export default function CheckoutPage() {
       });
 
       const created = await createRes.json().catch(() => null);
-      if (!createRes.ok) throw new Error(pickErrorMessage(created, "No se pudo crear la orden"));
+      if (!createRes.ok) {
+        throw new Error(pickErrorMessage(created, "No se pudo crear la orden"));
+      }
 
       const orderId: string | undefined = created?.orderDocumentId || created?.orderId;
       const orderNumericId: string | undefined = created?.orderNumericId;
       const mpExtFromServer: string | undefined = created?.mpExternalReference;
 
-      if (!orderId) throw new Error("No se recibió orderDocumentId/orderId desde /api/orders/create");
+      if (!orderId) {
+        throw new Error("No se recibió orderDocumentId/orderId desde /api/orders/create");
+      }
 
       const mpExternalReferenceFinal = mpExtFromServer || mpExternalReference;
       const orderNumber = makeOrderNumber(orderNumericId || orderId);
@@ -405,16 +434,33 @@ export default function CheckoutPage() {
           mpExternalReference: mpExternalReferenceFinal,
           items: mpItems,
 
-          total: finalQuote.total,
-          subtotal: finalQuote.subtotal,
-          discountTotal: finalQuote.discountTotal,
+          total: totalNum,
+          subtotal: Math.round(toNum(finalQuote.subtotal, 0)),
+          discountTotal: Math.round(toNum(finalQuote.discountTotal, 0)),
           coupon: coupon.trim() || null,
           appliedPromotions: finalQuote.appliedPromotions,
         }),
       });
 
       const pref = await prefRes.json().catch(() => null);
-      if (!prefRes.ok) throw new Error(pickErrorMessage(pref, "No se pudo crear la preferencia MP"));
+
+      // ✅ MOSTRAR STOCK (409) EN VEZ DE "Total inválido"
+      if (prefRes.status === 409 && pref?.code === "OUT_OF_STOCK") {
+        const probs = Array.isArray(pref?.problems) ? pref.problems : [];
+        setStockProblems(
+          probs.map((p: any) => ({
+            productDocumentId: String(p?.productDocumentId ?? p?.documentId ?? ""),
+            title: String(p?.title ?? "Producto"),
+            requested: Number(p?.requested ?? 0),
+            available: Number(p?.available ?? 0),
+          }))
+        );
+        throw new Error("No hay stock suficiente para completar la compra.");
+      }
+
+      if (!prefRes.ok) {
+        throw new Error(pickErrorMessage(pref, "No se pudo crear la preferencia MP"));
+      }
 
       const checkoutUrl: string | undefined = pref?.sandbox_init_point || pref?.init_point;
       if (!checkoutUrl) throw new Error("MercadoPago no devolvió init_point / sandbox_init_point.");
@@ -442,23 +488,98 @@ export default function CheckoutPage() {
       <Container>
         <h1 className="text-3xl font-extrabold py-8">Checkout</h1>
 
-        {error && (
-          <div className="mb-4 rounded bg-red-50 p-3 text-sm text-red-700">{error}</div>
+        {(error || stockProblems.length > 0) && (
+          <div className="mb-4 rounded bg-red-50 p-3 text-sm text-red-700">
+            {error ? <div className="font-semibold">{error}</div> : null}
+
+            {stockProblems.length > 0 && (
+              <div className="mt-2">
+                <div className="font-semibold">Problemas de stock:</div>
+                <ul className="mt-1 list-disc pl-5 text-red-700">
+                  {stockProblems.map((p) => (
+                    <li key={p.productDocumentId || p.title}>
+                      <b>{p.title}</b>: pediste {p.requested} y hay {p.available}.
+                    </li>
+                  ))}
+                </ul>
+                <div className="mt-2 text-xs text-red-700/80">
+                  Ajustá cantidades en el carrito y volvé a intentar.
+                </div>
+              </div>
+            )}
+          </div>
         )}
 
         {ui.kind === "form" && (
           <form onSubmit={handleSubmit} className="max-w-md space-y-4">
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Nombre" className="w-full border p-2" required />
-            <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" type="email" className="w-full border p-2" required />
-            <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="Teléfono" type="tel" className="w-full border p-2" required />
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Nombre"
+              className="w-full border p-2"
+              required
+            />
+            <input
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="Email"
+              type="email"
+              className="w-full border p-2"
+              required
+            />
+            <input
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              placeholder="Teléfono"
+              type="tel"
+              className="w-full border p-2"
+              required
+            />
 
-            <input value={street} onChange={(e) => setStreet(e.target.value)} placeholder="Calle" className="w-full border p-2" required />
-            <input value={number} onChange={(e) => setNumber(e.target.value)} placeholder="Número / Altura" className="w-full border p-2" required />
-            <input value={city} onChange={(e) => setCity(e.target.value)} placeholder="Ciudad" className="w-full border p-2" required />
-            <input value={province} onChange={(e) => setProvince(e.target.value)} placeholder="Provincia" className="w-full border p-2" required />
-            <input value={postalCode} onChange={(e) => setPostalCode(e.target.value)} placeholder="Código postal" className="w-full border p-2" inputMode="numeric" required />
+            <input
+              value={street}
+              onChange={(e) => setStreet(e.target.value)}
+              placeholder="Calle"
+              className="w-full border p-2"
+              required
+            />
+            <input
+              value={number}
+              onChange={(e) => setNumber(e.target.value)}
+              placeholder="Número / Altura"
+              className="w-full border p-2"
+              required
+            />
+            <input
+              value={city}
+              onChange={(e) => setCity(e.target.value)}
+              placeholder="Ciudad"
+              className="w-full border p-2"
+              required
+            />
+            <input
+              value={province}
+              onChange={(e) => setProvince(e.target.value)}
+              placeholder="Provincia"
+              className="w-full border p-2"
+              required
+            />
+            <input
+              value={postalCode}
+              onChange={(e) => setPostalCode(e.target.value)}
+              placeholder="Código postal"
+              className="w-full border p-2"
+              inputMode="numeric"
+              required
+            />
 
-            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Notas (piso, depto, referencia, timbre...) (opcional)" className="w-full border p-2" rows={2} />
+            <textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="Notas (piso, depto, referencia, timbre...) (opcional)"
+              className="w-full border p-2"
+              rows={2}
+            />
 
             {/* Cupón */}
             <input
@@ -511,7 +632,11 @@ export default function CheckoutPage() {
               ) : null}
             </div>
 
-            <button type="submit" disabled={loading || quoting} className="w-full rounded bg-red-600 py-3 text-white disabled:opacity-60">
+            <button
+              type="submit"
+              disabled={loading || quoting}
+              className="w-full rounded bg-red-600 py-3 text-white disabled:opacity-60"
+            >
               {loading ? "Redirigiendo…" : "Pagar con MercadoPago"}
             </button>
 
@@ -551,9 +676,7 @@ export default function CheckoutPage() {
         {ui.kind === "timeout" && (
           <div className="max-w-md rounded border p-4">
             <p className="font-semibold">No pudimos confirmar el pago todavía.</p>
-            <p className="text-sm opacity-80">
-              Podés refrescar en unos segundos o revisar el estado más tarde.
-            </p>
+            <p className="text-sm opacity-80">Podés refrescar en unos segundos o revisar el estado más tarde.</p>
             <Link href="/" className="mt-3 inline-block underline">
               Volver a la tienda
             </Link>

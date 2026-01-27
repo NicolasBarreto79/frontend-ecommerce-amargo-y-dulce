@@ -1,3 +1,4 @@
+// src/components/products/ProductCard.tsx
 import Link from "next/link";
 import Image from "next/image";
 
@@ -6,7 +7,7 @@ import Image from "next/image";
  * Compatible con Strapi v5
  */
 export type ProductCardItem = {
-  id: number;              // ✅ nuevo
+  id: number; // id numérico interno (v4/v5)
   slug: string;
   title: string;
   description?: string;
@@ -14,26 +15,31 @@ export type ProductCardItem = {
   imageUrl?: string;
   off?: number;
   category?: string;
-  documentId?: string | null; // ✅ Strapi v5       // (si lo estás usando)
-};
 
+  // ✅ Strapi v5 (estable)
+  documentId?: string | null;
+
+  // ✅ para limitar qty en carrito
+  stock?: number | null;
+};
 
 /**
  * Card reutilizable de producto:
  * - Imagen real de Strapi (si existe)
  * - Badge de descuento (si off existe)
  * - Precio tachado + precio final (si off existe)
- * - Click lleva a /productos/[slug]
+ * - Click lleva a /productos/[id] (documentId si existe)
  */
 export function ProductCard({ item }: { item: ProductCardItem }) {
   const hasOff = typeof item.off === "number" && item.off > 0;
-  const finalPrice = hasOff
-    ? Math.round(item.price * (1 - item.off! / 100))
-    : item.price;
+  const finalPrice = hasOff ? Math.round(item.price * (1 - item.off! / 100)) : item.price;
+
+  // ✅ en v5 es mejor navegar por documentId si lo tenés
+  const href = item.documentId ? `/productos/${encodeURIComponent(item.documentId)}` : `/productos/${item.id}`;
 
   return (
     <Link
-      href={`/productos/${item.id}`}
+      href={href}
       className="group block rounded-lg border border-neutral-200 bg-white p-4 transition hover:shadow-sm"
     >
       {/* Imagen / Placeholder */}
@@ -64,9 +70,18 @@ export function ProductCard({ item }: { item: ProductCardItem }) {
           {item.title}
         </h3>
 
-        <p className="mt-1 line-clamp-2 text-xs text-neutral-600">
-          {item.description}
-        </p>
+        {item.description ? (
+          <p className="mt-1 line-clamp-2 text-xs text-neutral-600">{item.description}</p>
+        ) : (
+          <p className="mt-1 text-xs text-neutral-400">—</p>
+        )}
+
+        {/* Stock (opcional) */}
+        {typeof item.stock === "number" && (
+          <div className="mt-2 text-xs text-neutral-600">
+            Stock: <span className="font-semibold">{item.stock}</span>
+          </div>
+        )}
 
         {/* Precio */}
         {hasOff ? (
