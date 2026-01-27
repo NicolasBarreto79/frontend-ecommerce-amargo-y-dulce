@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
 
 export const dynamic = "force-dynamic";
 
@@ -6,12 +7,14 @@ export const dynamic = "force-dynamic";
  * GET /api/orders/:id
  *
  * Soporta:
- * - documentId (Strapi v5)  ✅ recomendado
+ * - documentId (Strapi v5)
  * - orderNumber (ej: "AMG-0051")
- * - id numérico (legacy) -> lo buscamos por filters[id][$eq] como fallback (puede no funcionar siempre en v5)
+ * - id numérico (legacy)
  *
- * Devuelve:
- * { data: { documentId, id, ...fields } }
+ * Seguridad:
+ * - Requiere cookie strapi_jwt (usuario logueado)
+ * - Solo devuelve el pedido si pertenece al usuario (order.user.id === me.id)
+ *   o si coincide email (fallback para pedidos viejos sin relación user)
  */
 
 function isNumeric(v: string) {
@@ -25,57 +28,102 @@ function normalizeStrapiBase(url: string) {
   return u;
 }
 
-async function fetchStrapi(url: string, token: string) {
+async function fetchStrapi(url: string, jwt: string) {
   const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { Authorization: `Bearer ${jwt}` },
     cache: "no-store",
   });
   const json = await res.json().catch(() => null);
   return { res, json };
 }
 
+// Normaliza row a "flat" + devuelve también raw
 function normalizeOrderRow(row: any) {
-  // Strapi v5: row.documentId, row.id, row.<fields>
+  const flat = row?.attributes ? { id: row.id, ...row.attributes } : row;
   return {
     data: {
-      documentId: row?.documentId ?? null,
-      id: row?.id ?? null, // numérico interno (útil solo para mostrar)
-      ...row,
+      documentId: flat?.documentId ?? row?.documentId ?? null,
+      id: flat?.id ?? row?.id ?? null,
+      ...flat,
     },
+    raw: row,
   };
 }
 
+function pickOwnerInfo(row: any) {
+  // soporta v4: row.attributes.user.data.id
+  // soporta v5 (posible): row.user?.id
+  const userId =
+    row?.user?.id ??
+    row?.attributes?.user?.data?.id ??
+    row?.attributes?.user?.data?.documentId ??
+    row?.user?.data?.id ??
+    null;
+
+  const email =
+    row?.email ??
+    row?.attributes?.email ??
+    null;
+
+  return { userId, email: typeof email === "string" ? email.trim().toLowerCase() : null };
+}
+
 export async function GET(_: Request, { params }: { params: { id: string } }) {
+  const jwt = cookies().get("strapi_jwt")?.value;
+  if (!jwt) {
+    return NextResponse.json({ error: "No autenticado" }, { status: 401 });
+  }
+
   const strapiBase = normalizeStrapiBase(
     process.env.STRAPI_URL ||
       process.env.NEXT_PUBLIC_STRAPI_URL ||
       "http://localhost:1337"
   );
 
-  const token = process.env.STRAPI_API_TOKEN || process.env.STRAPI_TOKEN;
-  if (!token) {
-    return NextResponse.json(
-      { error: "Falta STRAPI_API_TOKEN / STRAPI_TOKEN" },
-      { status: 500 }
-    );
-  }
-
   const idOrNumber = String(params.id || "").trim();
   if (!idOrNumber) {
     return NextResponse.json({ error: "Falta id" }, { status: 400 });
   }
 
-  // 1) Intento directo por documentId (Strapi v5)
-  // Esto funciona si el param es documentId.
-  {
-    const url = `${strapiBase}/api/orders/${encodeURIComponent(idOrNumber)}?populate=*`;
-    const { res, json } = await fetchStrapi(url, token);
+  // 0) Usuario logueado (para chequear ownership)
+  const meRes = await fetchStrapi(`${strapiBase}/api/users/me`, jwt);
+  if (!meRes.res.ok) {
+    return NextResponse.json(
+      { error: "JWT inválido o expirado", status: meRes.res.status, details: meRes.json },
+      { status: 401 }
+    );
+  }
+  const me = meRes.json;
+  const meId = me?.id ?? null;
+  const meEmail = typeof me?.email === "string" ? me.email.trim().toLowerCase() : null;
 
-    if (res.ok && json?.data) {
-      return NextResponse.json(normalizeOrderRow(json.data));
+  if (!meId && !meEmail) {
+    return NextResponse.json({ error: "No se pudo resolver usuario" }, { status: 500 });
+  }
+
+  async function authorizeAndReturn(row: any) {
+    const { userId, email } = pickOwnerInfo(row);
+
+    const okByUser = !!meId && !!userId && String(userId) === String(meId);
+    const okByEmail = !!meEmail && !!email && email === meEmail;
+
+    if (!okByUser && !okByEmail) {
+      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
 
-    // Si no es 404, devolvemos error real
+    const normalized = normalizeOrderRow(row);
+    return NextResponse.json({ data: normalized.data }, { status: 200 });
+  }
+
+  // 1) Intento directo por documentId (Strapi v5)
+  {
+    const url = `${strapiBase}/api/orders/${encodeURIComponent(idOrNumber)}?populate=*`;
+    const { res, json } = await fetchStrapi(url, jwt);
+
+    if (res.ok && json?.data) {
+      return authorizeAndReturn(json.data);
+    }
+
     if (!res.ok && res.status !== 404) {
       return NextResponse.json(
         { error: "Strapi error", status: res.status, details: json },
@@ -84,7 +132,7 @@ export async function GET(_: Request, { params }: { params: { id: string } }) {
     }
   }
 
-  // 2) Si no fue documentId, buscamos por orderNumber (ej AMG-0051)
+  // 2) Buscar por orderNumber (AMG-XXXX)
   {
     const q = new URLSearchParams();
     q.set("filters[orderNumber][$eq]", idOrNumber);
@@ -92,7 +140,7 @@ export async function GET(_: Request, { params }: { params: { id: string } }) {
     q.set("populate", "*");
 
     const url = `${strapiBase}/api/orders?${q.toString()}`;
-    const { res, json } = await fetchStrapi(url, token);
+    const { res, json } = await fetchStrapi(url, jwt);
 
     if (!res.ok) {
       return NextResponse.json(
@@ -102,10 +150,10 @@ export async function GET(_: Request, { params }: { params: { id: string } }) {
     }
 
     const row = json?.data?.[0];
-    if (row) return NextResponse.json(normalizeOrderRow(row));
+    if (row) return authorizeAndReturn(row);
   }
 
-  // 3) Fallback legacy: buscar por id numérico interno (puede no funcionar en v5, pero lo intentamos)
+  // 3) Fallback por id numérico
   if (isNumeric(idOrNumber)) {
     const q = new URLSearchParams();
     q.set("filters[id][$eq]", idOrNumber);
@@ -113,7 +161,7 @@ export async function GET(_: Request, { params }: { params: { id: string } }) {
     q.set("populate", "*");
 
     const url = `${strapiBase}/api/orders?${q.toString()}`;
-    const { res, json } = await fetchStrapi(url, token);
+    const { res, json } = await fetchStrapi(url, jwt);
 
     if (!res.ok) {
       return NextResponse.json(
@@ -123,7 +171,7 @@ export async function GET(_: Request, { params }: { params: { id: string } }) {
     }
 
     const row = json?.data?.[0];
-    if (row) return NextResponse.json(normalizeOrderRow(row));
+    if (row) return authorizeAndReturn(row);
   }
 
   return NextResponse.json(

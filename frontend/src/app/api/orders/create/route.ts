@@ -1,6 +1,7 @@
 // src/app/api/orders/create/route.ts
 import { NextResponse } from "next/server";
 import crypto from "crypto";
+import { cookies } from "next/headers";
 
 export const dynamic = "force-dynamic";
 
@@ -51,6 +52,29 @@ function readShipping(obj: any) {
   };
 }
 
+async function getLoggedUser(strapiBase: string) {
+  const jwt = cookies().get("strapi_jwt")?.value;
+  if (!jwt) return null;
+
+  try {
+    const r = await fetch(`${strapiBase}/api/users/me`, {
+      headers: { Authorization: `Bearer ${jwt}` },
+      cache: "no-store",
+    });
+
+    if (!r.ok) return null;
+
+    const me = await r.json().catch(() => null);
+    const id = me?.id ?? null; // Strapi v4 devuelve id
+    const email = typeof me?.email === "string" ? me.email.trim().toLowerCase() : null;
+
+    if (!id) return null;
+    return { id, email };
+  } catch {
+    return null;
+  }
+}
+
 export async function POST(req: Request) {
   const strapiBase = normalizeStrapiBase(
     process.env.STRAPI_URL ||
@@ -58,6 +82,7 @@ export async function POST(req: Request) {
       "http://localhost:1337"
   );
 
+  // Este token es el de servidor (API token) para crear la orden en Strapi
   const token = process.env.STRAPI_TOKEN || process.env.STRAPI_API_TOKEN;
   if (!token) {
     return NextResponse.json(
@@ -87,10 +112,20 @@ export async function POST(req: Request) {
     );
   }
 
+  // ✅ si hay usuario logueado, lo resolvemos acá (id + email)
+  const logged = await getLoggedUser(strapiBase);
+
   // ===================== VALIDACIONES server-side (obligatorios) =====================
 
   const name = isNonEmptyString(incomingData.name) ? incomingData.name.trim() : "";
-  const email = isNonEmptyString(incomingData.email) ? incomingData.email.trim() : "";
+
+  // ✅ si está logueado, usamos SIEMPRE el email del usuario
+  const email = logged?.email
+    ? logged.email
+    : isNonEmptyString(incomingData.email)
+    ? incomingData.email.trim().toLowerCase()
+    : "";
+
   const phone = isNonEmptyString(incomingData.phone) ? incomingData.phone.trim() : "";
 
   if (name.length < 2) return badRequest("Nombre inválido", { name });
@@ -147,6 +182,10 @@ export async function POST(req: Request) {
       },
 
       mpExternalReference,
+
+      // ✅ guardar relación con el usuario logueado (nuevo campo relation en Order)
+      ...(logged?.id ? { user: logged.id } : {}),
+
       // NO ponemos orderNumber acá porque todavía no tenemos numericId con certeza
     },
   };

@@ -24,15 +24,17 @@ function formatARS(n: number) {
 }
 
 function normalizeOrderPayload(json: any): Order | null {
-  const row = json?.data?.attributes
-    ? {
-        ...(json.data.attributes ?? {}),
-        id: json.data.id,
-        documentId: json.data.documentId,
-      }
-    : json?.data ?? null;
+  // ✅ Nuevo endpoint devuelve: { data: { ...flat } }
+  const data = json?.data ?? null;
+  if (!data) return null;
 
-  if (!row) return null;
+  // ✅ Compat: si viene en formato Strapi v4: { data: { id, attributes } }
+  const row =
+    data?.attributes
+      ? { ...(data.attributes ?? {}), id: data.id, documentId: data.documentId ?? null }
+      : data;
+
+  if (!row || typeof row !== "object") return null;
 
   return {
     documentId: row.documentId ?? null,
@@ -148,29 +150,17 @@ function Tracking({ status }: { status: string }) {
 
 /* ================== LINKS a productos ================== */
 
-function isBadToken(s: string) {
-  const v = String(s || "").trim().toLowerCase();
-  return !v || v === "undefined" || v === "null" || v === "nan" || v === "[object object]";
-}
-
-/**
- * ✅ AHORA: productId en el pedido = documentId (string)
- * Entonces linkeamos directo a /productos/<documentId>
- * (y tu /productos/[id] ya resuelve por documentId cuando NO es numérico).
- */
 function getProductHrefFromItem(it: any) {
-  // ✅ 1) PRIORIDAD: documentId (Strapi v5)
-  const docId = it?.productDocumentId ?? it?.product_documentId ?? null;
+  // 1) documentId (si existiera en tu item)
+  const docId = it?.productDocumentId ?? it?.product_documentId ?? it?.documentId ?? null;
   const doc = String(docId ?? "").trim();
-  if (doc && doc !== "null" && doc !== "undefined") {
-    return `/productos/${encodeURIComponent(doc)}`;
-  }
+  if (doc && doc !== "null" && doc !== "undefined") return `/productos/${encodeURIComponent(doc)}`;
 
-  // ✅ 2) fallback: id numérico de Strapi (v4/v5)
-  const idNum = Number(it?.productId ?? it?.product_id ?? null);
+  // 2) id numérico (muy común)
+  const idNum = Number(it?.productId ?? it?.product_id ?? it?.id ?? null);
   if (Number.isFinite(idNum) && idNum > 0) return `/productos/${idNum}`;
 
-  // ✅ 3) último fallback: búsqueda
+  // 3) búsqueda por título
   const title = String(it?.title ?? "").trim();
   if (title) return `/productos?q=${encodeURIComponent(title)}`;
 
@@ -183,7 +173,9 @@ export default function PedidoDetallePage() {
 
   const [loading, setLoading] = useState(true);
   const [order, setOrder] = useState<Order | null>(null);
+
   const [error, setError] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<"unauth" | "forbidden" | null>(null);
 
   useEffect(() => {
     if (!id) return;
@@ -193,12 +185,27 @@ export default function PedidoDetallePage() {
     async function run() {
       setLoading(true);
       setError(null);
+      setAuthError(null);
 
       try {
         const r = await fetch(`/api/orders/${encodeURIComponent(id)}`, { cache: "no-store" });
         const json = await r.json().catch(() => null);
 
-        if (!r.ok) throw new Error(json?.error || `HTTP ${r.status}`);
+        if (!r.ok) {
+          if (r.status === 401) {
+            if (!alive) return;
+            setOrder(null);
+            setAuthError("unauth");
+            return;
+          }
+          if (r.status === 403) {
+            if (!alive) return;
+            setOrder(null);
+            setAuthError("forbidden");
+            return;
+          }
+          throw new Error(json?.error || `HTTP ${r.status}`);
+        }
 
         const o = normalizeOrderPayload(json);
         if (!o) throw new Error("Pedido no encontrado");
@@ -239,7 +246,9 @@ export default function PedidoDetallePage() {
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
               <h1 className="text-3xl font-extrabold text-neutral-900">Detalle de pedido</h1>
-              <p className="mt-2 text-sm text-neutral-600">{loading ? "Cargando..." : "Información del pedido."}</p>
+              <p className="mt-2 text-sm text-neutral-600">
+                {loading ? "Cargando..." : "Información del pedido."}
+              </p>
             </div>
 
             <Link
@@ -250,7 +259,31 @@ export default function PedidoDetallePage() {
             </Link>
           </div>
 
-          {error && <div className="mt-6 rounded-2xl border bg-white p-6 text-sm text-red-700">{error}</div>}
+          {authError === "unauth" && (
+            <div className="mt-6 rounded-2xl border bg-white p-6 text-sm text-neutral-800">
+              Tenés que <b>iniciar sesión</b> para ver este pedido.
+              <div className="mt-4">
+                <Link href="/" className="text-sm font-semibold text-red-700 hover:underline">
+                  Ir a la tienda →
+                </Link>
+              </div>
+            </div>
+          )}
+
+          {authError === "forbidden" && (
+            <div className="mt-6 rounded-2xl border bg-white p-6 text-sm text-neutral-800">
+              No tenés permiso para ver este pedido.
+              <div className="mt-4">
+                <Link href="/mis-pedidos" className="text-sm font-semibold text-red-700 hover:underline">
+                  Volver a Mis pedidos →
+                </Link>
+              </div>
+            </div>
+          )}
+
+          {error && (
+            <div className="mt-6 rounded-2xl border bg-white p-6 text-sm text-red-700">{error}</div>
+          )}
 
           {!error && !loading && order && (
             <div className="mt-8 grid gap-6 lg:grid-cols-2">
@@ -277,7 +310,9 @@ export default function PedidoDetallePage() {
                   {order.shippingAddress?.text && (
                     <div>
                       <div className="text-neutral-600">Dirección</div>
-                      <div className="mt-1 font-semibold text-neutral-900">{String(order.shippingAddress.text)}</div>
+                      <div className="mt-1 font-semibold text-neutral-900">
+                        {String(order.shippingAddress.text)}
+                      </div>
                     </div>
                   )}
 
@@ -324,7 +359,9 @@ export default function PedidoDetallePage() {
                           </div>
                         </div>
 
-                        <div className="shrink-0 text-sm font-extrabold text-neutral-900">{formatARS(line)}</div>
+                        <div className="shrink-0 text-sm font-extrabold text-neutral-900">
+                          {formatARS(line)}
+                        </div>
                       </div>
                     );
                   })}

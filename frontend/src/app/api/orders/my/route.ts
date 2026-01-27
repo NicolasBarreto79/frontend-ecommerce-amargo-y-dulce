@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
 
 export const dynamic = "force-dynamic";
 
@@ -11,19 +12,29 @@ function normalizeStrapiBase(url: string) {
 
 function pickIdForOps(row: any) {
   // Strapi v5: documentId; v4: id
-  return row?.documentId ?? row?.id ?? row?.attributes?.documentId ?? row?.attributes?.id ?? null;
+  return (
+    row?.documentId ??
+    row?.id ??
+    row?.attributes?.documentId ??
+    row?.attributes?.id ??
+    null
+  );
 }
 
 function pickField(row: any, key: string) {
   return row?.[key] ?? row?.attributes?.[key] ?? null;
 }
 
-export async function GET(req: Request) {
-  const { searchParams } = new URL(req.url);
-  const email = (searchParams.get("email") || "").trim().toLowerCase();
+async function fetchJson(url: string, init: RequestInit) {
+  const r = await fetch(url, { ...init, cache: "no-store" });
+  const json = await r.json().catch(() => null);
+  return { r, json };
+}
 
-  if (!email || !email.includes("@")) {
-    return NextResponse.json({ error: "Email inválido" }, { status: 400 });
+export async function GET() {
+  const jwt = cookies().get("strapi_jwt")?.value;
+  if (!jwt) {
+    return NextResponse.json({ error: "No autenticado" }, { status: 401 });
   }
 
   const strapiBase = normalizeStrapiBase(
@@ -32,37 +43,73 @@ export async function GET(req: Request) {
       "http://localhost:1337"
   );
 
-  const token = process.env.STRAPI_API_TOKEN || process.env.STRAPI_TOKEN;
-  if (!token) {
+  // 1) Usuario logueado
+  const meRes = await fetchJson(`${strapiBase}/api/users/me`, {
+    headers: { Authorization: `Bearer ${jwt}` },
+  });
+
+  if (!meRes.r.ok) {
     return NextResponse.json(
-      { error: "Falta STRAPI_API_TOKEN / STRAPI_TOKEN" },
+      { error: "JWT inválido o expirado", status: meRes.r.status, details: meRes.json },
+      { status: 401 }
+    );
+  }
+
+  const me = meRes.json;
+  const userId = me?.id ?? null; // v4 users/me devuelve id
+  const userEmail = String(me?.email || "").trim().toLowerCase();
+
+  if (!userId && !userEmail) {
+    return NextResponse.json(
+      { error: "No se pudo resolver usuario (sin id/email)" },
       { status: 500 }
     );
   }
 
+  // 2) Pedidos del usuario (preferimos relación user)
   const sp = new URLSearchParams();
-  sp.set("filters[email][$eq]", email);
   sp.set("pagination[pageSize]", "50");
   sp.set("sort[0]", "createdAt:desc");
-  sp.set("populate", "*"); // items/shippingAddress son json; populate no molesta
+  sp.set("populate", "*");
 
-  const url = `${strapiBase}/api/orders?${sp.toString()}`;
+  // ✅ con la relación nueva en Order: user
+  if (userId) {
+    // Strapi v4 relation filter
+    sp.set("filters[user][id][$eq]", String(userId));
+  }
 
-  const r = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-    cache: "no-store",
+  let ordersRes = await fetchJson(`${strapiBase}/api/orders?${sp.toString()}`, {
+    headers: { Authorization: `Bearer ${jwt}` },
   });
 
-  const json = await r.json().catch(() => null);
+  const dataByUser = Array.isArray(ordersRes.json?.data) ? ordersRes.json.data : [];
 
-  if (!r.ok) {
+  // 3) Fallback por email (para pedidos viejos sin user seteado)
+  const shouldFallback =
+    (!!userEmail && ordersRes.r.ok && dataByUser.length === 0) ||
+    (!!userEmail && !ordersRes.r.ok);
+
+  if (shouldFallback) {
+    const sp2 = new URLSearchParams();
+    sp2.set("filters[email][$eq]", userEmail);
+    sp2.set("pagination[pageSize]", "50");
+    sp2.set("sort[0]", "createdAt:desc");
+    sp2.set("populate", "*");
+
+    ordersRes = await fetchJson(`${strapiBase}/api/orders?${sp2.toString()}`, {
+      headers: { Authorization: `Bearer ${jwt}` },
+    });
+  }
+
+  if (!ordersRes.r.ok) {
     return NextResponse.json(
-      { error: "Strapi error", status: r.status, details: json },
-      { status: r.status }
+      { error: "Strapi error", status: ordersRes.r.status, details: ordersRes.json },
+      { status: ordersRes.r.status }
     );
   }
 
-  const data = Array.isArray(json?.data) ? json.data : [];
+  const data = Array.isArray(ordersRes.json?.data) ? ordersRes.json.data : [];
+
   const orders = data.map((row: any) => ({
     id: pickIdForOps(row),
     orderNumber: pickField(row, "orderNumber"),
@@ -71,6 +118,9 @@ export async function GET(req: Request) {
     createdAt: pickField(row, "createdAt"),
     shippingAddress: pickField(row, "shippingAddress"),
     items: pickField(row, "items"),
+    // opcional, por si querés debug:
+    // user: pickField(row, "user"),
+    // email: pickField(row, "email"),
   }));
 
   return NextResponse.json({ orders }, { status: 200 });

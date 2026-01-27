@@ -4,7 +4,15 @@ import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Container } from "./Container";
-import { Search, ShoppingCart, User, Menu, X, Package, LogOut } from "lucide-react";
+import {
+  Search,
+  ShoppingCart,
+  User,
+  Menu,
+  X,
+  Package,
+  LogOut,
+} from "lucide-react";
 import { LoginModal } from "@/components/auth/LoginModal";
 import { CartBadge } from "@/components/cart/CartBadge";
 
@@ -92,7 +100,11 @@ export function Header() {
   const [loadingSuggest, setLoadingSuggest] = useState(false);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [activeIndex, setActiveIndex] = useState(-1);
-  const suggestBoxRef = useRef<HTMLDivElement | null>(null);
+
+  // ✅ refs separados para evitar conflictos desktop vs mobile
+  const suggestBoxRefDesktop = useRef<HTMLDivElement | null>(null);
+  const suggestBoxRefMobile = useRef<HTMLDivElement | null>(null);
+
   const debounceRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -116,16 +128,21 @@ export function Header() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // ✅ click afuera: cierra sugerencias
+  // ✅ click afuera: cierra sugerencias (desktop + mobile)
   useEffect(() => {
     const onDocMouseDown = (e: MouseEvent) => {
-      const el = suggestBoxRef.current;
-      if (!el) return;
-      if (!el.contains(e.target as Node)) {
+      const elD = suggestBoxRefDesktop.current;
+      const elM = suggestBoxRefMobile.current;
+
+      const insideDesktop = elD?.contains(e.target as Node);
+      const insideMobile = elM?.contains(e.target as Node);
+
+      if (!insideDesktop && !insideMobile) {
         setOpenSuggest(false);
         setActiveIndex(-1);
       }
     };
+
     document.addEventListener("mousedown", onDocMouseDown);
     return () => document.removeEventListener("mousedown", onDocMouseDown);
   }, []);
@@ -236,10 +253,15 @@ export function Header() {
   function SearchBox({ variant }: { variant: "desktop" | "mobile" }) {
     const showDropdown = openSuggest && query.trim().length >= 2;
 
+    const ref =
+      variant === "desktop" ? suggestBoxRefDesktop : suggestBoxRefMobile;
+
     return (
-      <div ref={suggestBoxRef} className="relative w-full">
+      <div ref={ref} className="relative w-full">
         <form
-          className={variant === "desktop" ? "relative w-full max-w-[760px]" : "relative"}
+          className={
+            variant === "desktop" ? "relative w-full max-w-[760px]" : "relative"
+          }
           onSubmit={(e) => {
             e.preventDefault();
             goSearch(query);
@@ -263,7 +285,9 @@ export function Header() {
             }
             aria-autocomplete="list"
             aria-expanded={showDropdown}
-            aria-controls={variant === "desktop" ? "suggestions-desktop" : "suggestions-mobile"}
+            aria-controls={
+              variant === "desktop" ? "suggestions-desktop" : "suggestions-mobile"
+            }
           />
         </form>
 
@@ -358,7 +382,9 @@ export function Header() {
 
           {/* CENTRO */}
           <div className="hidden lg:flex justify-center">
-            <div className="relative w-full max-w-[760px]">{SearchBox({ variant: "desktop" })}</div>
+            <div className="relative w-full max-w-[760px]">
+              {SearchBox({ variant: "desktop" })}
+            </div>
           </div>
 
           {/* DERECHA */}
@@ -403,6 +429,7 @@ export function Header() {
 
             <div className="h-6 w-px bg-neutral-200" />
 
+            {/* ✅ Mis pedidos SOLO si está logueado */}
             {me && !meLoading && (
               <>
                 <Link
@@ -468,6 +495,7 @@ export function Header() {
                   Sobre nosotros
                 </NavLink>
 
+                {/* ✅ Mis pedidos SOLO si está logueado */}
                 {me && !meLoading && (
                   <NavLink href="/mis-pedidos" onClick={() => setMobileOpen(false)}>
                     Mis pedidos

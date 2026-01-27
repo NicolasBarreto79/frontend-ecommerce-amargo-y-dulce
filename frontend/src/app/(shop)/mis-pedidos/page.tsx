@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Container } from "@/components/layout/Container";
 
 type OrderRow = {
@@ -67,66 +68,76 @@ function StatusPill({ status }: { status: string }) {
 }
 
 export default function MisPedidosPage() {
-  const [email, setEmail] = useState("");
-  const [savedEmail, setSavedEmail] = useState<string | null>(null);
+  const router = useRouter();
+
+  const [meLoading, setMeLoading] = useState(true);
+  const [me, setMe] = useState<any | null>(null);
 
   const [loading, setLoading] = useState(false);
   const [orders, setOrders] = useState<OrderRow[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  // Cargar email guardado
+  // 1) Traer usuario logueado
   useEffect(() => {
-    const v = localStorage.getItem("amg_email");
-    if (v) {
-      setEmail(v);
-      setSavedEmail(v);
-    }
+    (async () => {
+      setMeLoading(true);
+      try {
+        const r = await fetch("/api/auth/me", { cache: "no-store" });
+        const j = await r.json().catch(() => ({ user: null }));
+        setMe(j?.user ?? null);
+      } catch {
+        setMe(null);
+      } finally {
+        setMeLoading(false);
+      }
+    })();
   }, []);
 
-  const canFetch = useMemo(() => email.trim().includes("@"), [email]);
-
-  async function loadOrders(targetEmail: string) {
-    const e = targetEmail.trim().toLowerCase();
-    if (!e.includes("@")) return;
-
-    setLoading(true);
-    setError(null);
-
-    try {
-      const r = await fetch(`/api/orders/my?email=${encodeURIComponent(e)}`, {
-        cache: "no-store",
-      });
-      const json = await r.json().catch(() => null);
-
-      if (!r.ok) {
-        throw new Error(json?.error || `HTTP ${r.status}`);
-      }
-
-      const list = Array.isArray(json?.orders) ? json.orders : [];
-      setOrders(list);
-    } catch (err: any) {
-      setOrders([]);
-      setError(err?.message || "No se pudieron cargar tus pedidos.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    const v = email.trim().toLowerCase();
-    if (!v.includes("@")) return;
-
-    localStorage.setItem("amg_email", v);
-    setSavedEmail(v);
-    loadOrders(v);
-  }
-
-  // Auto-cargar si ya había email guardado
+  // 2) Si no hay usuario, redirigir a home
   useEffect(() => {
-    if (savedEmail) loadOrders(savedEmail);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [savedEmail]);
+    if (!meLoading && !me) {
+      router.replace("/");
+    }
+  }, [meLoading, me, router]);
+
+  // 3) Cargar pedidos del usuario logueado
+  useEffect(() => {
+    if (meLoading || !me) return;
+
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const r = await fetch("/api/orders/my", { cache: "no-store" });
+        const json = await r.json().catch(() => null);
+
+        if (!r.ok) {
+          throw new Error(json?.error || `HTTP ${r.status}`);
+        }
+
+        const list = Array.isArray(json?.orders) ? json.orders : [];
+        setOrders(list);
+      } catch (err: any) {
+        setOrders([]);
+        setError(err?.message || "No se pudieron cargar tus pedidos.");
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [meLoading, me]);
+
+  if (meLoading) {
+    return (
+      <main>
+        <Container>
+          <div className="py-10">Cargando…</div>
+        </Container>
+      </main>
+    );
+  }
+
+  // Si no está logueado, redirigimos (este return evita flicker)
+  if (!me) return null;
 
   return (
     <main>
@@ -134,40 +145,14 @@ export default function MisPedidosPage() {
         <div className="py-10">
           <h1 className="text-3xl font-extrabold text-neutral-900">Mis pedidos</h1>
           <p className="mt-2 text-sm text-neutral-600">
-            Ingresá tu email para ver el historial.
+            Estos son tus pedidos asociados a tu cuenta.
           </p>
 
-          <form onSubmit={onSubmit} className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center">
-            <input
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="tu-email@ejemplo.com"
-              className="h-11 w-full rounded-full border border-neutral-300 bg-white px-4 text-sm outline-none focus:border-neutral-400"
-              type="email"
-            />
-            <button
-              type="submit"
-              disabled={!canFetch || loading}
-              className="h-11 rounded-full bg-neutral-900 px-6 text-sm font-semibold text-white disabled:opacity-50"
-            >
-              {loading ? "Cargando..." : "Ver pedidos"}
-            </button>
-
-            {savedEmail && (
-              <button
-                type="button"
-                onClick={() => {
-                  localStorage.removeItem("amg_email");
-                  setSavedEmail(null);
-                  setEmail("");
-                  setOrders([]);
-                }}
-                className="h-11 rounded-full border px-6 text-sm font-semibold text-neutral-900 hover:bg-neutral-50"
-              >
-                Cambiar email
-              </button>
-            )}
-          </form>
+          {loading && (
+            <div className="mt-6 rounded-2xl border bg-white p-5 text-sm text-neutral-700">
+              Cargando pedidos…
+            </div>
+          )}
 
           {error && (
             <div className="mt-6 rounded-2xl border bg-white p-5 text-sm text-red-700">
@@ -175,9 +160,9 @@ export default function MisPedidosPage() {
             </div>
           )}
 
-          {!error && savedEmail && !loading && orders.length === 0 && (
+          {!error && !loading && orders.length === 0 && (
             <div className="mt-6 rounded-2xl border bg-white p-5 text-sm text-neutral-700">
-              No encontramos pedidos para <b>{savedEmail}</b>.
+              Todavía no tenés pedidos.
             </div>
           )}
 
