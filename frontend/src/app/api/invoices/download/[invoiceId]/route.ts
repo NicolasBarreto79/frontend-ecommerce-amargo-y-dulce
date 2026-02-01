@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { downloadRemoteFileAsResponse } from "@/lib/download/remoteFile";
+import { ensureExt } from "@/lib/download/filenames";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,7 +17,11 @@ function pickFlat(row: any) {
   if (row?.attributes) {
     return {
       id: row.id ?? null,
-      documentId: row.documentId ?? row?.attributes?.documentId ?? row?.attributes?.document_id ?? null,
+      documentId:
+        row.documentId ??
+        row?.attributes?.documentId ??
+        row?.attributes?.document_id ??
+        null,
       ...row.attributes,
     };
   }
@@ -28,18 +34,24 @@ function pickPdfFile(inv: any) {
   return pickFlat(row);
 }
 
-function insertAttachment(url: string) {
-  if (url.includes("/upload/fl_attachment/")) return url;
-  if (url.includes("/upload/")) return url.replace("/upload/", "/upload/fl_attachment/");
-  return url;
-}
-
 function ensureAbsoluteUrl(url: string, fallbackOrigin: string) {
   const s = String(url ?? "").trim();
   if (!s) return "";
   if (/^https?:\/\//i.test(s)) return s;
   if (s.startsWith("/")) return `${fallbackOrigin}${s}`;
   return `${fallbackOrigin}/${s}`;
+}
+
+function sanitizeFileBaseName(name: string) {
+  // Permitimos letras/números/guion/underscore; convertimos espacios y símbolos a "_"
+  const s = String(name ?? "").trim();
+  if (!s) return "RC";
+  const normalized = s
+    .replace(/\s+/g, "_")
+    .replace(/[^\w-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return normalized || "RC";
 }
 
 async function getMe(req: Request) {
@@ -134,26 +146,43 @@ async function findOrderOwnerByOrderNumber(params: {
   return { ok: true as const, data: { ownerId, orderEmail }, url, raw: json };
 }
 
-export async function GET(req: Request, { params }: { params: { invoiceId: string } }) {
+export async function GET(
+  req: Request,
+  { params }: { params: { invoiceId: string } }
+) {
   const invoiceId = String(params.invoiceId || "").trim();
-  if (!invoiceId) return NextResponse.json({ error: "Missing invoiceId" }, { status: 400 });
+  if (!invoiceId) {
+    return NextResponse.json({ error: "Missing invoiceId" }, { status: 400 });
+  }
 
   const me = await getMe(req);
   if (!me) return NextResponse.json({ error: "No autorizado" }, { status: 401 });
 
   const strapiBase = normalizeStrapiBase(
-    process.env.STRAPI_URL || process.env.NEXT_PUBLIC_STRAPI_URL || "http://localhost:1337"
+    process.env.STRAPI_URL ||
+      process.env.NEXT_PUBLIC_STRAPI_URL ||
+      "http://localhost:1337"
   );
 
   const token = process.env.STRAPI_API_TOKEN || process.env.STRAPI_TOKEN;
-  if (!token) return NextResponse.json({ error: "Missing STRAPI_API_TOKEN" }, { status: 500 });
+  if (!token) {
+    return NextResponse.json(
+      { error: "Missing STRAPI_API_TOKEN" },
+      { status: 500 }
+    );
+  }
 
   // 1) Traer invoice + pdf (+ order/user si existe)
   const invRes = await findInvoiceByDocumentId({ strapiBase, token, invoiceId });
 
   if (!invRes.ok || !invRes.data) {
     return NextResponse.json(
-      { error: "No se pudo obtener la invoice", status: invRes.status, url: invRes.url, details: invRes.json },
+      {
+        error: "No se pudo obtener la invoice",
+        status: invRes.status,
+        url: invRes.url,
+        details: invRes.json,
+      },
       { status: invRes.status || 500 }
     );
   }
@@ -161,7 +190,6 @@ export async function GET(req: Request, { params }: { params: { invoiceId: strin
   const inv = invRes.data;
 
   // 2) Autorización:
-  // 2A) si existe relación invoice.order.user, usarla
   const orderRelNode = inv?.order?.data ?? inv?.order ?? null;
   const orderRel = pickFlat(orderRelNode);
 
@@ -174,18 +202,23 @@ export async function GET(req: Request, { params }: { params: { invoiceId: strin
   if (ownerIdFromRelation != null) {
     authorized = Number(ownerIdFromRelation) === Number(me.id);
   } else {
-    // 2B) Fallback NUEVO: derivar orderNumber desde invoice.number y validar contra Order.user
     const invNumber = inv?.number ?? inv?.invoiceNumber ?? null;
     const orderNumber = extractOrderNumberFromInvoiceNumber(invNumber);
 
     if (orderNumber) {
-      const owner = await findOrderOwnerByOrderNumber({ strapiBase, token, orderNumber });
+      const owner = await findOrderOwnerByOrderNumber({
+        strapiBase,
+        token,
+        orderNumber,
+      });
 
       if (owner.ok && owner.data) {
-        if (owner.data.ownerId != null && Number(owner.data.ownerId) === Number(me.id)) {
+        if (
+          owner.data.ownerId != null &&
+          Number(owner.data.ownerId) === Number(me.id)
+        ) {
           authorized = true;
         } else if (me.email && owner.data.orderEmail && me.email === owner.data.orderEmail) {
-          // fallback por email si por alguna razón no viene user
           authorized = true;
         }
       }
@@ -207,13 +240,29 @@ export async function GET(req: Request, { params }: { params: { invoiceId: strin
     );
   }
 
-  // 3) Redirect al pdf
+  // 3) Resolver URL del PDF
   const pdf = pickPdfFile(inv);
   const rawUrl = typeof pdf?.url === "string" ? pdf.url.trim() : "";
-  if (!rawUrl) return NextResponse.json({ error: "Esta invoice no tiene PDF" }, { status: 404 });
+  if (!rawUrl) {
+    return NextResponse.json({ error: "Esta invoice no tiene PDF" }, { status: 404 });
+  }
 
-  const abs = ensureAbsoluteUrl(rawUrl, strapiBase);
-  const dl = insertAttachment(abs);
+  const fileUrl = ensureAbsoluteUrl(rawUrl, strapiBase);
 
-  return NextResponse.redirect(encodeURI(dl), 302);
+  // ✅ 4) Nombre REAL de la factura: usar inv.number (ej: "RC_20260131_AMG_0155")
+  // Si inv.number viene con guiones, lo normalizamos a "_" para que quede exactamente como pedís.
+  const invNumberRaw = String(inv?.number ?? inv?.invoiceNumber ?? "").trim();
+  const baseName = invNumberRaw
+    ? sanitizeFileBaseName(invNumberRaw).replace(/-/g, "_")
+    : `RC_${invoiceId}`;
+
+  const filename = ensureExt(baseName, ".pdf");
+
+  // 5) Download reusable handler (stream)
+  return downloadRemoteFileAsResponse(fileUrl, {
+    filename,
+    contentTypeFallback: "application/pdf",
+    disposition: "attachment",
+    cacheSeconds: 0,
+  });
 }

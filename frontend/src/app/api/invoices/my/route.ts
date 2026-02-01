@@ -41,12 +41,20 @@ function toAbsStrapiUrl(strapiBase: string, maybeUrl: any) {
 }
 
 function pickPdfUrl(strapiBase: string, pdfField: any) {
-  // En Strapi v5 suele venir como objeto (no siempre data/attributes)
-  // Igual soportamos ambos.
   const node = pdfField?.data ?? pdfField;
   const row = Array.isArray(node) ? node[0] : node;
   const flat = pickAttr(row);
   return toAbsStrapiUrl(strapiBase, flat?.url);
+}
+
+/**
+ * Extrae AMG-#### desde un invoice.number (soporta RC-...-AMG-#### y RC_..._AMG-####)
+ */
+function extractOrderNumberFromInvoiceNumber(invoiceNumber: any): string | null {
+  const s = String(invoiceNumber ?? "").trim();
+  if (!s) return null;
+  const m = /(AMG-\d{4,})/i.exec(s);
+  return m?.[1] ? m[1].toUpperCase() : null;
 }
 
 /**
@@ -62,7 +70,7 @@ async function getMyOrderNumbers(params: {
   const { strapiBase, serverToken, userId, userEmail } = params;
   const headers = { Authorization: `Bearer ${serverToken}` };
 
-  // Intento 1: por relación user.id (si tu Order tiene relación a users-permissions user)
+  // Intento 1: por relación user.id
   if (userId) {
     const sp = new URLSearchParams();
     sp.set("pagination[pageSize]", "200");
@@ -77,13 +85,13 @@ async function getMyOrderNumbers(params: {
       for (const row of data) {
         const flat = flattenAny(row);
         const on = typeof flat?.orderNumber === "string" ? flat.orderNumber.trim() : "";
-        if (on) set.add(on);
+        if (on) set.add(on.toUpperCase());
       }
       if (set.size) return { set, used: "userId" as const, url };
     }
   }
 
-  // Intento 2: por email (si tu Order guarda email)
+  // Intento 2: por email
   if (userEmail) {
     const sp = new URLSearchParams();
     sp.set("pagination[pageSize]", "200");
@@ -98,7 +106,7 @@ async function getMyOrderNumbers(params: {
       for (const row of data) {
         const flat = flattenAny(row);
         const on = typeof flat?.orderNumber === "string" ? flat.orderNumber.trim() : "";
-        if (on) set.add(on);
+        if (on) set.add(on.toUpperCase());
       }
       return { set, used: "email" as const, url };
     }
@@ -116,7 +124,7 @@ async function getMyOrderNumbers(params: {
 async function listInvoicesWithPdf(strapiBase: string, token: string) {
   const headers = { Authorization: `Bearer ${token}` };
 
-  // Intento A: populate[0]=pdf
+  // Intento A: populate[0]=pdf + sort issuedAt desc
   {
     const sp = new URLSearchParams();
     sp.set("pagination[pageSize]", "200");
@@ -128,7 +136,7 @@ async function listInvoicesWithPdf(strapiBase: string, token: string) {
     if (res.r.status !== 400) return { ok: false as const, url, ...res };
   }
 
-  // Intento B: populate=pdf
+  // Intento B: populate=pdf + sort issuedAt desc
   {
     const sp = new URLSearchParams();
     sp.set("pagination[pageSize]", "200");
@@ -140,11 +148,12 @@ async function listInvoicesWithPdf(strapiBase: string, token: string) {
     if (res.r.status !== 400) return { ok: false as const, url, ...res };
   }
 
-  // Intento C: sin populate (por si tu Strapi no banca populate en tokens)
+  // Intento C: sin populate, pero con sort fallback createdAt desc
   {
     const sp = new URLSearchParams();
     sp.set("pagination[pageSize]", "200");
-    sp.set("sort[0]", "issuedAt:desc");
+    // algunos setups no tienen issuedAt, por eso fallback:
+    sp.set("sort[0]", "createdAt:desc");
     const url = `${strapiBase}/api/invoices?${sp.toString()}`;
     const res = await fetchJson(url, { headers });
     return { ok: res.r.ok as boolean, url, ...res };
@@ -193,7 +202,6 @@ export async function GET() {
 
   const myOrderNumbers = myOrders.set;
 
-  // Si no hay orders, devolvemos vacío (no es error)
   if (myOrderNumbers.size === 0) {
     return NextResponse.json(
       {
@@ -225,34 +233,31 @@ export async function GET() {
 
   const rows = Array.isArray(list.json?.data) ? list.json.data : [];
 
-  // 4) Filtrar por convención: invoice.number termina con "-{orderNumber}"
+  // 4) Filtrar por AMG-#### extraído del invoice.number (soporta RC- y RC_)
   const ownedRows = rows.filter((row: any) => {
     const inv = flattenAny(row);
     const number = typeof inv?.number === "string" ? inv.number.trim() : "";
     if (!number) return false;
 
-    // match exacto por sufijo
-    for (const on of myOrderNumbers) {
-      if (number.endsWith(`-${on}`)) return true;
-    }
-    return false;
+    const on = extractOrderNumberFromInvoiceNumber(number);
+    if (!on) return false;
+
+    return myOrderNumbers.has(on);
   });
 
+  // 5) Mapear
   const invoices = ownedRows.map((row: any) => {
     const inv = flattenAny(row);
+    const invNumber = inv?.number ?? null;
 
     return {
       id: inv?.documentId ?? inv?.id ?? null,
-      number: inv?.number ?? null,
-      issuedAt: inv?.issuedAt ?? null,
+      number: invNumber,
+      issuedAt: inv?.issuedAt ?? inv?.createdAt ?? null,
       total: inv?.total ?? null,
       currency: inv?.currency ?? "ARS",
       pdfUrl: pickPdfUrl(strapiBase, inv?.pdf),
-      // opcional: podemos inferir orderNumber desde el sufijo
-      orderNumber:
-        typeof inv?.number === "string"
-          ? (inv.number.split("-").slice(-2).join("-") || null) // AMG-0154
-          : null,
+      orderNumber: extractOrderNumberFromInvoiceNumber(invNumber),
     };
   });
 

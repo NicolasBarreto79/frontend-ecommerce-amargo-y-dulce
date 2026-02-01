@@ -49,26 +49,35 @@ function pickFlat(row: any) {
   if (row?.attributes) {
     return {
       id: row.id ?? null,
-      documentId: row.documentId ?? row?.attributes?.documentId ?? row?.attributes?.document_id ?? null,
+      documentId:
+        row.documentId ??
+        row?.attributes?.documentId ??
+        row?.attributes?.document_id ??
+        null,
       ...row.attributes,
     };
   }
   return row;
 }
 
+// ✅ RC_YYYYMMDD_AMG-0172
 function buildInvoiceNumber(orderNumber?: string | null) {
   const ts = new Date();
   const y = ts.getFullYear();
   const mm = String(ts.getMonth() + 1).padStart(2, "0");
   const dd = String(ts.getDate()).padStart(2, "0");
   const base = (orderNumber || "AMG-XXXX").replace(/\s+/g, "");
-  return `RC-${y}${mm}${dd}-${base}`;
+  return `RC_${y}${mm}${dd}_${base}`;
 }
 
 /**
- * FIND invoice by number SIN usar `order` en query
+ * FIND invoice by number (robusto)
  */
-async function findInvoiceByNumber(strapiBase: string, token: string, number: string) {
+async function findInvoiceByNumber(
+  strapiBase: string,
+  token: string,
+  number: string
+) {
   // Intento A: populate[0]=pdf
   {
     const sp = new URLSearchParams();
@@ -131,10 +140,13 @@ async function findInvoiceByNumber(strapiBase: string, token: string, number: st
 }
 
 /**
- * ✅ Trae una orden por documentId usando el endpoint de LISTA (find),
- * para evitar 401/403 en /orders/:id (findOne) dependiendo de permisos/rutas.
+ * ✅ Trae una orden por documentId usando el endpoint de LISTA (find)
  */
-async function fetchOrderByDocumentId(strapiBase: string, token: string, orderDocumentId: string) {
+async function fetchOrderByDocumentId(
+  strapiBase: string,
+  token: string,
+  orderDocumentId: string
+) {
   const sp = new URLSearchParams();
   sp.set("pagination[pageSize]", "1");
   sp.set("filters[documentId][$eq]", orderDocumentId);
@@ -155,7 +167,6 @@ async function fetchOrderByDocumentId(strapiBase: string, token: string, orderDo
   const flat = pickFlat(row);
   if (!flat) return null;
 
-  // Aseguramos documentId
   const doc = String(flat?.documentId ?? "").trim();
   if (!doc) {
     const err: any = new Error("STRAPI_ORDER_MISSING_DOCUMENTID");
@@ -172,13 +183,19 @@ async function fetchOrderByDocumentId(strapiBase: string, token: string, orderDo
  * Fuente robusta para PDFKit en Next
  */
 function applyPdfFont(doc: any) {
-  const fontPath = path.join(process.cwd(), "src", "assets", "fonts", "DejaVuSans.ttf");
+  const fontPath = path.join(
+    process.cwd(),
+    "src",
+    "assets",
+    "fonts",
+    "DejaVuSans.ttf"
+  );
 
   try {
     const buf = fs.readFileSync(fontPath);
     const size = buf.length;
-    const headHex = buf.slice(0, 4).toString("hex"); // 00010000
-    const headAscii = buf.slice(0, 4).toString("ascii"); // OTTO
+    const headHex = buf.slice(0, 4).toString("hex");
+    const headAscii = buf.slice(0, 4).toString("ascii");
 
     const isTtf = headHex === "00010000";
     const isOtf = headAscii === "OTTO";
@@ -197,7 +214,10 @@ function applyPdfFont(doc: any) {
     doc.registerFont("DejaVu", fontPath);
     doc.font("DejaVu");
   } catch (e: any) {
-    console.warn("[invoice/pdf] No pude aplicar fuente (uso Helvetica):", e?.message || e);
+    console.warn(
+      "[invoice/pdf] No pude aplicar fuente (uso Helvetica):",
+      e?.message || e
+    );
     doc.font("Helvetica");
   }
 }
@@ -206,7 +226,9 @@ async function renderPdfBuffer(order: any) {
   const doc = new PDFDocument({ size: "A4", margin: 50 });
   const chunks: Buffer[] = [];
 
-  doc.on("data", (c: any) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+  doc.on("data", (c: any) =>
+    chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c))
+  );
   const done = new Promise<Buffer>((resolve, reject) => {
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
@@ -217,6 +239,18 @@ async function renderPdfBuffer(order: any) {
   const orderNumber = String(order?.orderNumber ?? "").trim() || "AMG-XXXX";
   const createdAt = order?.createdAt ? new Date(order.createdAt) : new Date();
   const issuedAt = new Date();
+
+  // ✅ FIX: Formato 24hs + timezone Argentina
+  const dateFmt: Intl.DateTimeFormatOptions = {
+    timeZone: "America/Argentina/Buenos_Aires",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  };
 
   const shippingMethod = order?.shippingMethod ?? "delivery";
   const shippingCost = Number(order?.shippingCost ?? 0);
@@ -230,13 +264,16 @@ async function renderPdfBuffer(order: any) {
 
   doc.fontSize(18).text("Amargo y Dulce", { align: "left" });
   doc.moveDown(0.2);
-  doc.fontSize(12).fillColor("#444").text("Comprobante / Recibo", { align: "left" });
+  doc
+    .fontSize(12)
+    .fillColor("#444")
+    .text("Comprobante / Recibo", { align: "left" });
   doc.moveDown(1);
 
   doc.fillColor("#000");
   doc.fontSize(11).text(`Pedido: ${orderNumber}`);
-  doc.text(`Fecha pedido: ${createdAt.toLocaleString("es-AR")}`);
-  doc.text(`Fecha emisión: ${issuedAt.toLocaleString("es-AR")}`);
+  doc.text(`Fecha pedido: ${createdAt.toLocaleString("es-AR", dateFmt)}`);
+  doc.text(`Fecha emisión: ${issuedAt.toLocaleString("es-AR", dateFmt)}`);
   doc.moveDown(0.6);
 
   doc.text(`Cliente: ${order?.name ?? "-"}`);
@@ -247,7 +284,9 @@ async function renderPdfBuffer(order: any) {
   doc.fontSize(11).text(
     `Entrega: ${
       shippingMethod === "pickup"
-        ? `Retiro en sucursal${pickupPoint ? ` (${pickupPoint})` : ""} — GRATIS`
+        ? `Retiro en sucursal${
+            pickupPoint ? ` (${pickupPoint})` : ""
+          } — GRATIS`
         : `Envío a domicilio — ${moneyARS(shippingCost)}`
     }`
   );
@@ -264,7 +303,9 @@ async function renderPdfBuffer(order: any) {
     const line = qty * unit;
 
     doc.text(`${title}`);
-    doc.fillColor("#444").text(`  ${qty} x ${moneyARS(unit)} = ${moneyARS(line)}`);
+    doc
+      .fillColor("#444")
+      .text(`  ${qty} x ${moneyARS(unit)} = ${moneyARS(line)}`);
     doc.fillColor("#000");
     doc.moveDown(0.2);
   });
@@ -274,24 +315,93 @@ async function renderPdfBuffer(order: any) {
   doc.fontSize(11).text(`Subtotal: ${moneyARS(subtotal)}`, { align: "right" });
   doc.text(`Descuento: -${moneyARS(discountTotal)}`, { align: "right" });
   doc.text(
-    `Envío: ${shippingMethod === "pickup" ? moneyARS(0) : moneyARS(shippingCost)}`,
+    `Envío: ${
+      shippingMethod === "pickup" ? moneyARS(0) : moneyARS(shippingCost)
+    }`,
     { align: "right" }
   );
   doc.fontSize(13).text(`TOTAL: ${moneyARS(total)}`, { align: "right" });
 
   doc.moveDown(1.2);
-  doc.fontSize(9).fillColor("#666").text(
-    "Este comprobante no constituye factura fiscal. Conservá este documento como constancia de tu compra.",
-    { align: "left" }
-  );
+  doc
+    .fontSize(9)
+    .fillColor("#666")
+    .text(
+      "Este comprobante no constituye factura fiscal. Conservá este documento como constancia de tu compra.",
+      { align: "left" }
+    );
 
   doc.end();
   return done;
 }
 
+function pickPdfUrlFromInvoice(inv: any): string | null {
+  const node = inv?.pdf?.data ?? inv?.pdf ?? null;
+  const row = Array.isArray(node) ? node[0] : node;
+  const flat = pickFlat(row);
+  const url = flat?.url ?? flat?.attributes?.url ?? null;
+  return typeof url === "string" && url.trim() ? url.trim() : null;
+}
+
+/**
+ * ✅ Crear invoice SIN order/orderNumber (Strapi los rechaza en tu caso)
+ * Intentamos varias formas de setear el media `pdf`.
+ */
+async function createInvoiceMinimal(params: {
+  strapiBase: string;
+  token: string;
+  baseInvoiceData: any;
+  fileId: number;
+}) {
+  const { strapiBase, token, baseInvoiceData, fileId } = params;
+
+  const createUrl = `${strapiBase}/api/invoices`;
+
+  const candidates: any[] = [
+    { data: { ...baseInvoiceData, pdf: fileId } },
+    { data: { ...baseInvoiceData, pdf: { connect: [fileId] } } },
+    { data: { ...baseInvoiceData, pdf: { data: fileId } } },
+  ];
+
+  let lastErr: any = null;
+
+  for (const payload of candidates) {
+    const res = await fetch(createUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      cache: "no-store",
+    });
+
+    const text = await res.text().catch(() => "");
+    let json: any = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      json = { _raw: text || null };
+    }
+
+    if (res.ok)
+      return {
+        ok: true as const,
+        data: json?.data ?? json,
+        payloadUsed: payload,
+      };
+
+    lastErr = { status: res.status, details: json, payloadTried: payload };
+  }
+
+  return { ok: false as const, ...lastErr };
+}
+
 export async function POST(req: Request) {
   const strapiBase = normalizeStrapiBase(
-    process.env.STRAPI_URL || process.env.NEXT_PUBLIC_STRAPI_URL || "http://localhost:1337"
+    process.env.STRAPI_URL ||
+      process.env.NEXT_PUBLIC_STRAPI_URL ||
+      "http://localhost:1337"
   );
 
   const tokenRaw = process.env.STRAPI_TOKEN || process.env.STRAPI_API_TOKEN;
@@ -307,15 +417,21 @@ export async function POST(req: Request) {
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "Body inválido (se esperaba JSON)" }, { status: 400 });
+    return NextResponse.json(
+      { error: "Body inválido (se esperaba JSON)" },
+      { status: 400 }
+    );
   }
 
   const orderId = String(body?.orderId ?? "").trim();
   if (!orderId) {
-    return NextResponse.json({ error: "Falta orderId (documentId)" }, { status: 400 });
+    return NextResponse.json(
+      { error: "Falta orderId (documentId)" },
+      { status: 400 }
+    );
   }
 
-  // 1) Traer orden (por LISTA con filters para evitar 401 del findOne)
+  // 1) Traer orden
   let order: any = null;
   try {
     order = await fetchOrderByDocumentId(strapiBase, token, orderId);
@@ -342,7 +458,10 @@ export async function POST(req: Request) {
   const status = String(order?.orderStatus ?? "").toLowerCase();
   if (status !== "paid") {
     return NextResponse.json(
-      { error: "La orden todavía no está pagada", orderStatus: order?.orderStatus },
+      {
+        error: "La orden todavía no está pagada",
+        orderStatus: order?.orderStatus,
+      },
       { status: 409 }
     );
   }
@@ -354,7 +473,17 @@ export async function POST(req: Request) {
   try {
     const existing = await findInvoiceByNumber(strapiBase, token, invoiceNumber);
     if (existing) {
-      return NextResponse.json({ ok: true, alreadyExists: true, invoice: existing }, { status: 200 });
+      const pdfUrl = pickPdfUrlFromInvoice(existing);
+      return NextResponse.json(
+        {
+          ok: true,
+          alreadyExists: true,
+          invoiceNumber,
+          pdfUrl,
+          invoice: existing,
+        },
+        { status: 200 }
+      );
     }
   } catch (e: any) {
     return NextResponse.json(
@@ -383,7 +512,11 @@ export async function POST(req: Request) {
   // 4) Upload a Strapi
   const uploadUrl = `${strapiBase}/api/upload`;
   const form = new FormData();
-  form.append("files", new Blob([pdfBuffer], { type: "application/pdf" }), filename);
+  form.append(
+    "files",
+    new Blob([pdfBuffer], { type: "application/pdf" }),
+    filename
+  );
 
   const uploadRes = await fetch(uploadUrl, {
     method: "POST",
@@ -402,14 +535,21 @@ export async function POST(req: Request) {
 
   if (!uploadRes.ok || !Array.isArray(uploaded) || !uploaded[0]?.id) {
     return NextResponse.json(
-      { error: "No se pudo subir el PDF a Strapi", status: uploadRes.status, details: uploaded },
+      {
+        error: "No se pudo subir el PDF a Strapi",
+        status: uploadRes.status,
+        details: uploaded,
+      },
       { status: 500 }
     );
   }
 
   const fileId = uploaded[0].id;
+  const uploadedPdfUrl = uploaded?.[0]?.url
+    ? String(uploaded[0].url).trim()
+    : null;
 
-  // 5) Crear Invoice (SIN `order` para evitar "Invalid key order")
+  // 5) Crear Invoice SOLO con campos válidos
   const baseInvoiceData: any = {
     number: invoiceNumber,
     issuedAt: new Date().toISOString(),
@@ -417,62 +557,44 @@ export async function POST(req: Request) {
     currency: "ARS",
   };
 
-  // Intento 1: pdf: fileId
-  const payload1 = { data: { ...baseInvoiceData, pdf: fileId } };
-
-  let createRes = await fetch(`${strapiBase}/api/invoices`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload1),
-    cache: "no-store",
+  const createdRes = await createInvoiceMinimal({
+    strapiBase,
+    token,
+    baseInvoiceData,
+    fileId,
   });
 
-  let createdText = await createRes.text().catch(() => "");
-  let created: any = null;
-  try {
-    created = createdText ? JSON.parse(createdText) : null;
-  } catch {
-    created = { _raw: createdText || null };
-  }
-
-  // Intento 2 (fallback): pdf connect
-  if (!createRes.ok) {
-    const payload2 = { data: { ...baseInvoiceData, pdf: { connect: [fileId] } } };
-
-    createRes = await fetch(`${strapiBase}/api/invoices`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
+  if (!createdRes.ok) {
+    return NextResponse.json(
+      {
+        error: "No se pudo crear Invoice",
+        status: createdRes.status,
+        details: createdRes.details,
+        payloadTried: createdRes.payloadTried,
+        note: "Tu Strapi rechaza order/orderNumber. Creamos invoice solo con pdf + number + totals.",
       },
-      body: JSON.stringify(payload2),
-      cache: "no-store",
-    });
-
-    createdText = await createRes.text().catch(() => "");
-    try {
-      created = createdText ? JSON.parse(createdText) : null;
-    } catch {
-      created = { _raw: createdText || null };
-    }
-
-    if (!createRes.ok) {
-      return NextResponse.json(
-        {
-          error: "No se pudo crear Invoice",
-          status: createRes.status,
-          details: created,
-          payloadTried: { payload1, payload2 },
-          note:
-            "Strapi está rechazando campos en el create. Este endpoint no manda `order` para evitar 'Invalid key order'.",
-        },
-        { status: 500 }
-      );
-    }
+      { status: 500 }
+    );
   }
 
-  return NextResponse.json({ ok: true, invoice: created?.data ?? created }, { status: 200 });
+  // 6) Re-fetch para devolver invoice con pdf (y que el webhook la use)
+  let fetched: any = null;
+  try {
+    fetched = await findInvoiceByNumber(strapiBase, token, invoiceNumber);
+  } catch {
+    fetched = null;
+  }
+
+  const pdfUrl = (fetched ? pickPdfUrlFromInvoice(fetched) : null) || uploadedPdfUrl || null;
+
+  return NextResponse.json(
+    {
+      ok: true,
+      invoiceNumber,
+      pdfUrl,
+      invoice: createdRes.data,
+      fetched,
+    },
+    { status: 200 }
+  );
 }
